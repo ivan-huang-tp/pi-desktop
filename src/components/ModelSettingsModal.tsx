@@ -88,6 +88,14 @@ export const ModelSettingsModal: React.FC<ModelSettingsModalProps> = ({
   // 新增模型與 Provider 互動
   const [newModelInput, setNewModelInput] = useState<string>('');
   const [isAddingModel, setIsAddingModel] = useState<boolean>(false);
+  const [isAddingProvider, setIsAddingProvider] = useState<boolean>(false);
+  // 新增供應商表單欄位
+  const [newProviderKey, setNewProviderKey] = useState<string>('');
+  const [newProviderName, setNewProviderName] = useState<string>('');
+  const [newProviderBaseUrl, setNewProviderBaseUrl] = useState<string>('');
+  const [newProviderApi, setNewProviderApi] = useState<string>('');
+  const [newProviderApiKey, setNewProviderApiKey] = useState<string>('');
+  const [newProviderModelId, setNewProviderModelId] = useState<string>('');
   const [applyToActiveSession, setApplyToActiveSession] = useState<boolean>(true);
 
   // 載入設定
@@ -142,26 +150,145 @@ export const ModelSettingsModal: React.FC<ModelSettingsModalProps> = ({
     }
   }, [isOpen]);
 
+  // 把某個 provider 的 endpoint 與其模型細項載入到表單欄位
+  const applyProvider = (key: string) => {
+    const prov = modelsConfig.providers?.[key];
+    if (!prov) return;
+    setProviderName(prov.name || key);
+    setBaseUrl(prov.baseUrl || '');
+    setApiKey(prov.apiKey || '');
+    const firstModel = prov.models?.[0]?.id || '';
+    setSelectedModelId(firstModel);
+
+    if (prov.models?.[0]) {
+      const mObj = prov.models[0];
+      setMaxTokens(mObj.maxTokens || 8192);
+      setContextWindow(mObj.contextWindow || 128000);
+      setReasoning(Boolean(mObj.reasoning));
+      setTemperature(mObj.samplingParams?.temperature ?? 0.0);
+      setTopP(mObj.samplingParams?.top_p ?? 1.0);
+    }
+  };
+
   // 當切換 Provider
   const handleSelectProvider = (key: string) => {
     setSelectedProviderKey(key);
-    const prov = modelsConfig.providers?.[key];
-    if (prov) {
-      setProviderName(prov.name || key);
+    if (key) applyProvider(key);
+  };
+
+  // 新增供應商：填寫 Provider 名稱 + Base URL + Model ID（＋選填 API 協定／金鑰）
+  const handleAddProvider = () => {
+    const key = newProviderKey.trim();
+    const url = newProviderBaseUrl.trim();
+    const modelId = newProviderModelId.trim();
+
+    if (!key) {
+      setStatusMessage({ text: '請填寫供應商 Key（例如 local-vllm）', type: 'error' });
+      return;
+    }
+    if (!/^[A-Za-z0-9._-]+$/.test(key)) {
+      setStatusMessage({ text: '供應商 Key 只能使用英數與 - _ . 字元', type: 'error' });
+      return;
+    }
+    if (modelsConfig.providers?.[key]) {
+      setStatusMessage({ text: `供應商 ${key} 已存在`, type: 'error' });
+      return;
+    }
+    if (!url) {
+      setStatusMessage({ text: '請填寫 Base URL（例如 http://127.0.0.1:8010/v1）', type: 'error' });
+      return;
+    }
+    if (!modelId) {
+      setStatusMessage({ text: '請填寫至少一個 Model ID', type: 'error' });
+      return;
+    }
+
+    const newProvider: ProviderDetailConfig = {
+      name: newProviderName.trim() || key,
+      baseUrl: url,
+      api: newProviderApi.trim() || 'openai-completions',
+      apiKey: newProviderApiKey.trim() || key,
+      models: [
+        {
+          id: modelId,
+          name: modelId.split('/').pop() || modelId,
+          contextWindow: 128000,
+          maxTokens: 8192,
+        },
+      ],
+    };
+
+    const updated: ModelsConfig = {
+      ...modelsConfig,
+      providers: {
+        ...modelsConfig.providers,
+        [key]: newProvider,
+      },
+    };
+
+    setModelsConfig(updated);
+    setSelectedProviderKey(key);
+    setProviderName(newProvider.name || key);
+    setBaseUrl(newProvider.baseUrl || '');
+    setApiKey(newProvider.apiKey || '');
+    setSelectedModelId(modelId);
+    setMaxTokens(8192);
+    setContextWindow(128000);
+    setReasoning(false);
+    setTemperature(0.0);
+    setTopP(1.0);
+
+    // 第一個供應商順便設成預設，避免存檔後 App 找不到預設模型
+    if (Object.keys(modelsConfig.providers || {}).length === 0) {
+      setSettingsConfig((prev) => ({ ...prev, defaultProvider: key, defaultModel: modelId }));
+    }
+    setNewProviderKey('');
+    setNewProviderName('');
+    setNewProviderBaseUrl('');
+    setNewProviderApi('');
+    setNewProviderApiKey('');
+    setNewProviderModelId('');
+    setIsAddingProvider(false);
+    setStatusMessage({ text: `已新增供應商 ${key}，請按「儲存並套用」寫入 models.json`, type: 'success' });
+  };
+
+  // 刪除目前選中的供應商（存檔後才真正寫入檔案）
+  const handleDeleteProvider = () => {
+    const key = selectedProviderKey;
+    if (!key || !modelsConfig.providers?.[key]) return;
+    if (
+      !confirm(
+        `確定要刪除供應商「${modelsConfig.providers[key]?.name || key}」嗎？\n按下「儲存並套用」後才會寫入 models.json。`,
+      )
+    ) {
+      return;
+    }
+
+    const rest = { ...modelsConfig.providers };
+    delete rest[key];
+    const remainingKeys = Object.keys(rest);
+    setModelsConfig({ ...modelsConfig, providers: rest });
+
+    const nextKey = remainingKeys[0] || '';
+    setSelectedProviderKey(nextKey);
+    if (nextKey) {
+      const prov = rest[nextKey];
+      setProviderName(prov.name || nextKey);
       setBaseUrl(prov.baseUrl || '');
       setApiKey(prov.apiKey || '');
-      const firstModel = prov.models?.[0]?.id || '';
-      setSelectedModelId(firstModel);
-
-      if (prov.models?.[0]) {
-        const mObj = prov.models[0];
-        setMaxTokens(mObj.maxTokens || 8192);
-        setContextWindow(mObj.contextWindow || 128000);
-        setReasoning(Boolean(mObj.reasoning));
-        setTemperature(mObj.samplingParams?.temperature ?? 0.0);
-        setTopP(mObj.samplingParams?.top_p ?? 1.0);
-      }
+      setSelectedModelId(prov.models?.[0]?.id || '');
+    } else {
+      setProviderName('');
+      setBaseUrl('');
+      setApiKey('');
+      setSelectedModelId('');
     }
+
+    setSettingsConfig((prev) =>
+      prev.defaultProvider === key ? { ...prev, defaultProvider: undefined, defaultModel: undefined } : prev,
+    );
+
+    setStatusMessage({ text: `已移除供應商 ${key}，請按「儲存並套用」寫入 models.json`, type: 'success' });
   };
 
   // 當切換 Model
@@ -231,11 +358,12 @@ export const ModelSettingsModal: React.FC<ModelSettingsModalProps> = ({
     try {
       // 複製一份並更新當前編輯中的模型細項與 Provider 連線資訊
       const nextModelsConfig: ModelsConfig = JSON.parse(JSON.stringify(modelsConfig));
+      // 只有設定檔裡真的存在這個 provider 才覆寫，否則丟掉未儲存的編輯（新增供應商按過「加入」後就已寫進 modelsConfig）
       if (selectedProviderKey && nextModelsConfig.providers[selectedProviderKey]) {
         const prov = nextModelsConfig.providers[selectedProviderKey];
-        prov.name = providerName;
+        if (providerName.trim()) prov.name = providerName.trim();
         prov.baseUrl = baseUrl;
-        prov.apiKey = apiKey;
+        if (apiKey.trim()) prov.apiKey = apiKey.trim();
 
         if (prov.models) {
           const mIdx = prov.models.findIndex((m) => m.id === selectedModelId);
@@ -255,11 +383,12 @@ export const ModelSettingsModal: React.FC<ModelSettingsModalProps> = ({
         }
       }
 
-      // 更新 settings.json
+      // 更新 settings.json；沒有可選模型時不要寫入空的 defaultModel，免得到預設模型解析失敗
       const nextSettingsConfig: SettingsConfig = {
         ...settingsConfig,
-        defaultProvider: selectedProviderKey,
-        defaultModel: selectedModelId,
+        ...(selectedProviderKey && selectedModelId
+          ? { defaultProvider: selectedProviderKey, defaultModel: selectedModelId }
+          : {}),
         defaultThinkingLevel: currentThinkingLevel,
       };
 
@@ -362,18 +491,119 @@ export const ModelSettingsModal: React.FC<ModelSettingsModalProps> = ({
             <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
               {/* Provider 選擇 */}
               <div>
-                <label className="block text-xs text-zinc-400 mb-1.5 font-medium">供應商 (Provider)</label>
-                <select
-                  value={selectedProviderKey}
-                  onChange={(e) => handleSelectProvider(e.target.value)}
-                  className="w-full bg-zinc-900 border border-zinc-700/80 rounded-lg px-3 py-2 text-zinc-200 text-xs focus:outline-none focus:border-indigo-500 transition"
-                >
-                  {Object.keys(modelsConfig.providers || {}).map((k) => (
-                    <option key={k} value={k}>
-                      {modelsConfig.providers[k]?.name || k} ({k})
-                    </option>
-                  ))}
-                </select>
+                <div className="flex items-center justify-between mb-1.5">
+                  <label className="text-xs text-zinc-400 font-medium">供應商 (Provider)</label>
+                  <div className="flex items-center space-x-2">
+                    {!isAddingProvider && (
+                      <button
+                        onClick={() => setIsAddingProvider(true)}
+                        className="text-[11px] text-indigo-400 hover:text-indigo-300 flex items-center space-x-1 transition"
+                      >
+                        <Plus size={12} />
+                        <span>新增供應商</span>
+                      </button>
+                    )}
+                    {selectedProviderKey && !isAddingProvider && (
+                      <button
+                        onClick={handleDeleteProvider}
+                        title="刪除目前的供應商"
+                        className="text-[11px] text-rose-400 hover:text-rose-300 flex items-center space-x-1 transition"
+                      >
+                        <Trash2 size={12} />
+                        <span>刪除</span>
+                      </button>
+                    )}
+                  </div>
+                </div>
+
+                {!isAddingProvider ? (
+                  <select
+                    value={selectedProviderKey}
+                    onChange={(e) => handleSelectProvider(e.target.value)}
+                    className="w-full bg-zinc-900 border border-zinc-700/80 rounded-lg px-3 py-2 text-zinc-200 text-xs focus:outline-none focus:border-indigo-500 transition"
+                  >
+                    {Object.keys(modelsConfig.providers || {}).length === 0 && (
+                      <option value="">（尚無供應商，請點右上「新增供應商」）</option>
+                    )}
+                    {Object.keys(modelsConfig.providers || {}).map((k) => (
+                      <option key={k} value={k}>
+                        {modelsConfig.providers[k]?.name || k} ({k})
+                      </option>
+                    ))}
+                  </select>
+                ) : (
+                  <div className="space-y-1.5">
+                    <input
+                      type="text"
+                      placeholder="供應商 Key，如 local-vllm（英數與 - _ .）"
+                      value={newProviderKey}
+                      onChange={(e) => setNewProviderKey(e.target.value)}
+                      className="w-full bg-zinc-900 border border-indigo-500/70 rounded-lg px-2.5 py-1.5 text-xs text-zinc-200 font-mono focus:outline-none"
+                      autoFocus
+                    />
+                    <input
+                      type="text"
+                      placeholder="顯示名稱（選填，預設同上）"
+                      value={newProviderName}
+                      onChange={(e) => setNewProviderName(e.target.value)}
+                      className="w-full bg-zinc-900 border border-indigo-500/70 rounded-lg px-2.5 py-1.5 text-xs text-zinc-200 focus:outline-none"
+                    />
+                    <input
+                      type="text"
+                      placeholder="Base URL，如 http://127.0.0.1:8010/v1"
+                      value={newProviderBaseUrl}
+                      onChange={(e) => setNewProviderBaseUrl(e.target.value)}
+                      className="w-full bg-zinc-900 border border-indigo-500/70 rounded-lg px-2.5 py-1.5 text-xs text-zinc-200 font-mono focus:outline-none"
+                    />
+                    <input
+                      type="text"
+                      placeholder="Model ID，如 DeepSeek-V4.1-Flash"
+                      value={newProviderModelId}
+                      onChange={(e) => setNewProviderModelId(e.target.value)}
+                      onKeyDown={(e) => e.key === 'Enter' && handleAddProvider()}
+                      className="w-full bg-zinc-900 border border-indigo-500/70 rounded-lg px-2.5 py-1.5 text-xs text-zinc-200 font-mono focus:outline-none"
+                    />
+                    <div className="flex items-center space-x-1.5">
+                      <input
+                        type="text"
+                        placeholder="API 協定（預設 openai-completions）"
+                        value={newProviderApi}
+                        onChange={(e) => setNewProviderApi(e.target.value)}
+                        className="flex-1 bg-zinc-900 border border-zinc-700/80 rounded-lg px-2.5 py-1.5 text-xs text-zinc-200 font-mono focus:outline-none focus:border-indigo-500"
+                      />
+                      <input
+                        type="text"
+                        placeholder="API Key（選填）"
+                        value={newProviderApiKey}
+                        onChange={(e) => setNewProviderApiKey(e.target.value)}
+                        className="flex-1 bg-zinc-900 border border-zinc-700/80 rounded-lg px-2.5 py-1.5 text-xs text-zinc-200 font-mono focus:outline-none focus:border-indigo-500"
+                      />
+                    </div>
+                    <div className="flex items-center space-x-1.5 pt-0.5">
+                      <button
+                        onClick={handleAddProvider}
+                        className="px-2.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-medium transition"
+                      >
+                        加入
+                      </button>
+                      <button
+                        onClick={() => {
+                          setIsAddingProvider(false);
+                          setNewProviderKey('');
+                          setNewProviderName('');
+                          setNewProviderBaseUrl('');
+                          setNewProviderApi('');
+                          setNewProviderApiKey('');
+                          setNewProviderModelId('');
+                        }}
+                        className="px-2 py-1.5 text-zinc-400 hover:text-zinc-200 rounded-lg text-xs transition"
+                      >
+                        取消
+                      </button>
+                      <span className="text-[11px] text-zinc-500">加入後記得按下方「儲存並套用」</span>
+                    </div>
+                  </div>
+                )}
               </div>
 
               {/* Model 選擇 */}
@@ -383,7 +613,9 @@ export const ModelSettingsModal: React.FC<ModelSettingsModalProps> = ({
                   {!isAddingModel && (
                     <button
                       onClick={() => setIsAddingModel(true)}
-                      className="text-[11px] text-indigo-400 hover:text-indigo-300 flex items-center space-x-1 transition"
+                      disabled={!selectedProviderKey}
+                      title={!selectedProviderKey ? '請先新增並選擇供應商' : undefined}
+                      className="text-[11px] text-indigo-400 hover:text-indigo-300 disabled:text-zinc-600 disabled:cursor-not-allowed flex items-center space-x-1 transition"
                     >
                       <Plus size={12} />
                       <span>新增模型</span>
@@ -612,42 +844,60 @@ export const ModelSettingsModal: React.FC<ModelSettingsModalProps> = ({
               <span>端點與認證 (Endpoint & Authentication)</span>
             </label>
 
-            <div className="space-y-3">
-              <div>
-                <label className="block text-xs text-zinc-400 mb-1 font-medium">Base URL</label>
-                <div className="relative flex items-center">
-                  <Globe size={13} className="absolute left-3 text-zinc-500" />
-                  <input
-                    type="text"
-                    value={baseUrl}
-                    onChange={(e) => setBaseUrl(e.target.value)}
-                    placeholder="https://api.siliconflow.com/v1"
-                    className="w-full bg-zinc-900 border border-zinc-700/80 rounded-lg pl-8 pr-3 py-1.5 text-xs text-zinc-200 font-mono focus:outline-none focus:border-indigo-500"
-                  />
+            {selectedProviderKey ? (
+              <div className="space-y-3">
+                <div>
+                  <label className="block text-xs text-zinc-400 mb-1 font-medium">Base URL</label>
+                  <div className="relative flex items-center">
+                    <Globe size={13} className="absolute left-3 text-zinc-500" />
+                    <input
+                      type="text"
+                      value={baseUrl}
+                      onChange={(e) => setBaseUrl(e.target.value)}
+                      placeholder="https://api.siliconflow.com/v1"
+                      className="w-full bg-zinc-900 border border-zinc-700/80 rounded-lg pl-8 pr-3 py-1.5 text-xs text-zinc-200 font-mono focus:outline-none focus:border-indigo-500"
+                    />
+                  </div>
                 </div>
-              </div>
 
-              <div>
-                <label className="block text-xs text-zinc-400 mb-1 font-medium">API Key</label>
-                <div className="relative flex items-center">
-                  <Key size={13} className="absolute left-3 text-zinc-500" />
-                  <input
-                    type={showApiKey ? 'text' : 'password'}
-                    value={apiKey}
-                    onChange={(e) => setApiKey(e.target.value)}
-                    placeholder="sk-..."
-                    className="w-full bg-zinc-900 border border-zinc-700/80 rounded-lg pl-8 pr-9 py-1.5 text-xs text-zinc-200 font-mono focus:outline-none focus:border-indigo-500"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => setShowApiKey(!showApiKey)}
-                    className="absolute right-2.5 p-1 text-zinc-500 hover:text-zinc-300"
-                  >
-                    {showApiKey ? <EyeOff size={13} /> : <Eye size={13} />}
-                  </button>
+                <div>
+                  <label className="block text-xs text-zinc-400 mb-1 font-medium">API Key</label>
+                  <div className="relative flex items-center">
+                    <Key size={13} className="absolute left-3 text-zinc-500" />
+                    <input
+                      type={showApiKey ? 'text' : 'password'}
+                      value={apiKey}
+                      onChange={(e) => setApiKey(e.target.value)}
+                      placeholder="sk-..."
+                      className="w-full bg-zinc-900 border border-zinc-700/80 rounded-lg pl-8 pr-9 py-1.5 text-xs text-zinc-200 font-mono focus:outline-none focus:border-indigo-500"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowApiKey(!showApiKey)}
+                      className="absolute right-2.5 p-1 text-zinc-500 hover:text-zinc-300"
+                    >
+                      {showApiKey ? <EyeOff size={13} /> : <Eye size={13} />}
+                    </button>
+                  </div>
                 </div>
+                <p className="text-[11px] text-zinc-500 leading-relaxed">
+                  這兩個值存在這個供應商身上（models.json 的 <span className="font-mono">{selectedProviderKey}.baseUrl</span> /{' '}
+                  <span className="font-mono">{selectedProviderKey}.apiKey</span>）。
+                  {baseUrl ? (
+                    <>
+                      {' '}
+                      目前連到 <span className="font-mono text-zinc-400">{baseUrl}</span>
+                    </>
+                  ) : null}
+                  ，換一次就對所有對話生效。
+                </p>
               </div>
-            </div>
+            ) : (
+              <p className="text-xs text-zinc-500 leading-relaxed">
+                請先於上方「新增供應商」填寫一次 Base URL 與 Model ID。建立後這個區塊會自動帶入該供應商的端點與金鑰，
+                之後不必再重複設定——更新供應商時才需要回到這裡修改。
+              </p>
+            )}
           </div>
 
         </div>
