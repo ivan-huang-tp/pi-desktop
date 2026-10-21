@@ -18,6 +18,14 @@
   - 支援遠端主機無縫連線與金鑰認證。
   - 直接在本地 UI 管理遠端伺服器上的 Pi 會話與專案環境。
   - 遠端終端機無縫接軌，即時監控遠端工作。
+  - **遠端終端機預設以 `tmux` 包住**：每個遠端目錄一個固定 session（`piui-<目錄名>`），斷線、關掉面板、重新載入頁面或重開程式都不會殺掉遠端正在跑的工作；再次開啟同一目錄會接回原本的畫面。遠端沒有 tmux 時自動退回普通 shell。可在「程式設定」關閉。
+    > 為什麼需要：node-pty 讓 `ssh -t` 取得真正的 pty，遠端互動 bash 因此是 session leader；連線一斷，pty master 關閉會讓 kernel 送 SIGHUP 給前景程序群組，把正在跑的工作一起殺掉。
+
+- **🩺 可設定的 Trace 記錄 (Diagnostic Trace)**
+  - 從左側欄的「程式設定」開啟，可自訂記錄目錄（預設 `R:\Temp`）與開關；含「測試寫入」「時間標記」「開檔案／開資料夾」。
+  - **關閉時完全不建立檔案、不寫硬碟**，所有記錄呼叫直接返回，對速度的影響趨近於零。
+  - 開啟時記錄 SSH 連線進出、pi RPC 指令與事件、終端機 I/O 與遠端程序結束碼——發生問題時直接提供這個檔案即可定位。
+  - 密碼、API Key、私鑰等機密會在寫檔前自動遮蔽；單檔 8MB 自動輪替，保留最近 5 份。
 
 - **🔄 分支與 Context 粒度控制**
   - 多輪對話分支切換與對比。
@@ -43,6 +51,7 @@
 - 安裝檔目前沒有程式碼簽章，第一次執行時 Windows SmartScreen 會顯示「Windows 已保護您的電腦」，點「其他資訊 → 仍要執行」即可。
 - SSH 遠端功能使用 Windows 內建的 OpenSSH 用戶端（Windows 10 1809 以上預設已安裝）。
 - 介面裡的「更新核心」會呼叫 `npm`，沒裝 Node.js 的電腦無法使用此功能，請改為下載新版安裝檔。
+- 遠端終端機若要具備「斷線不掉工作」的持久化能力，遠端主機需已安裝 `tmux`（未安裝時仍可正常使用，只是斷線會終止遠端工作）。
 
 ### 發佈新版本（維護者）
 
@@ -111,13 +120,15 @@ pi-ui/
 │   ├── main.cjs              # Electron 入口與視窗生命週期
 │   ├── pi-bridge.cjs         # 與 Pi CLI / Agent 通訊的橋接核心
 │   ├── core-launcher.cjs     # 用 App 內建的 Electron（Node 模式）啟動 Pi CLI
-│   ├── terminal-manager.cjs  # 本地與遠端 PTY 終端機管理器
-│   └── ssh-manager.cjs       # SSH 遠端連線與遠端專案管理
+│   ├── terminal-manager.cjs  # 本地與遠端 PTY 終端機管理器（遠端預設包 tmux）
+│   ├── ssh-manager.cjs       # SSH 遠端連線與遠端專案管理
+│   ├── app-settings.cjs      # 桌面程式設定檔（userData/app-settings.json）
+│   └── tracer.cjs            # 診斷記錄器（可設定目錄與開關、機密遮蔽）
 ├── resources/pi-core/        # 內建 Pi 核心（dist/ 由 scripts/fetch-core.mjs 下載）
 ├── scripts/fetch-core.mjs    # 打包前下載內建核心
 ├── .github/workflows/        # Windows 安裝檔建置與發佈
 ├── src/                      # React 前端介面
-│   ├── components/           # UI 元件（ChatArea, Sidebar, FileTree, Monaco...）
+│   ├── components/           # UI 元件（ChatArea, Sidebar, FileTree, Monaco, SettingsModal...）
 │   ├── types/                # 全域 TypeScript 介面定義
 │   ├── App.tsx               # 主應用程式框架
 │   └── main.tsx              # React 掛載入口
