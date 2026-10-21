@@ -1,0 +1,166 @@
+@import '@xterm/xterm/css/xterm.css';
+@import 'highlight.js/styles/github-dark.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* 自訂捲軸樣式 */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+::-webkit-scrollbar-thumb {
+  background: #27272a;
+  border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+  background: #3f3f46;
+}
+
+/* ============ Markdown 內文樣式 ============ */
+.md-body {
+  /* 對齊 text-sm 的新字級（原本 0.875rem / 14px） */
+  font-size: 0.9375rem;
+  line-height: 1.6;
+  color: #d4d4d8;
+  word-break: break-word;
+}
+.md-body > *:first-child {
+  margin-top: 0;
+}
+.md-body > *:last-child {
+  margin-bottom: 0;
+}
+.md-body p {
+  margin: 0.6em 0;
+}
+.md-body h1,
+.md-body h2,
+.md-body h3,
+.md-body h4,
+.md-body h5,
+.md-body h6 {
+  font-weight: 600;
+  color: #f4f4f5;
+  line-height: 1.3;
+  margin: 1.1em 0 0.5em;
+}
+.md-body h1 {
+  font-size: 1.4em;
+}
+.md-body h2 {
+  font-size: 1.25em;
+  border-bottom: 1px solid #27272a;
+  padding-bottom: 0.3em;
+}
+.md-body h3 {
+  font-size: 1.1em;
+}
+.md-body h4,
+.md-body h5,
+.md-body h6 {
+  font-size: 1em;
+}
+.md-body ul,
+.md-body ol {
+  margin: 0.6em 0;
+  padding-left: 1.5em;
+}
+.md-body ul {
+  list-style: disc;
+}
+.md-body ol {
+  list-style: decimal;
+}
+.md-body li {
+  margin: 0.25em 0;
+}
+.md-body li > ul,
+.md-body li > ol {
+  margin: 0.25em 0;
+}
+.md-body a {
+  color: #60a5fa;
+  text-decoration: none;
+}
+.md-body a:hover {
+  text-decoration: underline;
+}
+.md-body strong {
+  color: #f4f4f5;
+  font-weight: 600;
+}
+.md-body em {
+  font-style: italic;
+}
+.md-body blockquote {
+  border-left: 3px solid #3f3f46;
+  padding-left: 0.9em;
+  margin: 0.7em 0;
+  color: #a1a1aa;
+}
+.md-body hr {
+  border: 0;
+  border-top: 1px solid #27272a;
+  margin: 1.2em 0;
+}
+.md-body code {
+  font-family: Consolas, Menlo, Monaco, 'Courier New', monospace;
+  font-size: 0.85em;
+  background: rgba(63, 63, 70, 0.5);
+  padding: 0.15em 0.4em;
+  border-radius: 4px;
+  color: #f0abfc;
+}
+.md-body pre {
+  background: #0d1117;
+  border: 1px solid #27272a;
+  border-radius: 8px;
+  padding: 0.9em 1em;
+  overflow-x: auto;
+  margin: 0.8em 0;
+}
+.md-body pre code {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  color: inherit;
+  font-size: 0.82em;
+  line-height: 1.55;
+}
+.md-body table {
+  width: 100%;
+  border-collapse: collapse;
+  margin: 0.8em 0;
+  font-size: 0.85em;
+  display: block;
+  overflow-x: auto;
+}
+.md-body th,
+.md-body td {
+  border: 1px solid #27272a;
+  padding: 0.45em 0.7em;
+  text-align: left;
+}
+.md-body th {
+  background: #18181b;
+  color: #e4e4e7;
+  font-weight: 600;
+}
+.md-body tr:nth-child(even) td {
+  background: rgba(24, 24, 27, 0.5);
+}
+.md-body img {
+  max-width: 100%;
+  border-radius: 6px;
+}
+.md-body input[type='checkbox'] {
+  margin-right: 0.4em;
+}
