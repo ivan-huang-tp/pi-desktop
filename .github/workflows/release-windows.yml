@@ -1,0 +1,57 @@
+# 建置 Windows 安裝檔（NSIS .exe）
+#
+# - 推 tag `v*`（例如 v0.1.0）：建置並發佈到 GitHub Releases，使用者從 Releases 頁面直接下載。
+# - 手動 Run workflow：只建置，安裝檔放在該次 run 的 Artifacts，不建立 Release。
+#
+# 在 Windows runner 上建置，而不是在 Linux 交叉編譯：NSIS 的反安裝程式與 exe 資源編輯在 Linux 上需要 Wine，
+# 而 node-pty 在 Windows 直接用套件內附的 N-API prebuild，不需要 C++ 編譯器。
+name: Release (Windows)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check tag matches package.json version
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        run: |
+          pkg_version="$(node -p "require('./package.json').version")"
+          if [ "v${pkg_version}" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::tag ${GITHUB_REF_NAME} 與 package.json version ${pkg_version} 不一致"
+            exit 1
+          fi
+
+      - name: Build installer
+        run: npm run dist:win
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: PiAgentDesktop-windows-x64
+          path: release/*.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: release/*.exe
+          generate_release_notes: true

@@ -47,7 +47,8 @@ function createWindow() {
   // 啟動 Pi RPC Bridge (傳入 app 供 CoreManager 解析 userData)
   piBridge = new PiBridge(mainWindow, app);
   mainWindow.webContents.on('did-finish-load', () => {
-    piBridge.start(process.cwd());
+    // 安裝版從開始選單啟動時 cwd 是安裝目錄，不適合當預設工作區
+    piBridge.start(app.isPackaged ? os.homedir() : process.cwd());
   });
 
   mainWindow.on('closed', () => {

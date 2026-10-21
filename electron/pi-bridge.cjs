@@ -8,6 +8,16 @@ const { SshManager } = require('./ssh-manager.cjs');
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
+const CORE_LAUNCHER = path.join(__dirname, 'core-launcher.cjs');
+
+// 用 App 自己的 Electron 執行檔（ELECTRON_RUN_AS_NODE 模式）跑 Pi CLI，
+// 而不是 PATH 上的 `node`：直接下載安裝的 Windows 使用者通常沒有裝 Node.js，
+// 而且 Pi 核心要求 Node >= 22.19，Electron 內建的版本由 package.json 鎖定。
+function spawnCoreCli(cliPath, args, opts = {}) {
+  const env = { ...(opts.env || process.env), ELECTRON_RUN_AS_NODE: '1' };
+  return spawn(process.execPath, [CORE_LAUNCHER, cliPath, ...args], { ...opts, env });
+}
+
 // 從 message content (字串或區塊陣列) 取出純文字
 function extractText(content) {
   if (typeof content === 'string') return content;
@@ -76,7 +86,7 @@ class PiProcess {
       };
 
       if (core.cliPath) {
-        this.process = spawn('node', [core.cliPath, '--mode', 'rpc'], spawnOpts);
+        this.process = spawnCoreCli(core.cliPath, ['--mode', 'rpc'], spawnOpts);
       } else {
         this.process = spawn('cmd.exe', ['/c', 'pi', '--mode', 'rpc'], spawnOpts);
       }
@@ -1350,7 +1360,7 @@ class PiBridge {
 
       let child;
       if (core.cliPath) {
-        child = spawn('node', [core.cliPath, '--export', filePath, outputPath], {
+        child = spawnCoreCli(core.cliPath, ['--export', filePath, outputPath], {
           cwd,
           windowsHide: true,
         });

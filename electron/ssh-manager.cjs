@@ -168,11 +168,9 @@ class SshManager {
 
       if (process.platform === 'win32') {
         const batPath = path.join(dir, 'askpass.bat');
-        const nodeExe = process.execPath && process.execPath.toLowerCase().endsWith('node.exe')
-          ? `"${process.execPath}"`
-          : 'node';
-        // 若在打包後的 Electron，設定 ELECTRON_RUN_AS_NODE=1 即可把 Electron 當純 node 執行
-        const batContent = `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\n${nodeExe} "${jsPath}" %*\r\n`;
+        // process.execPath 在打包後是「Pi Agent Desktop.exe」而不是 node.exe；
+        // 設定 ELECTRON_RUN_AS_NODE=1 就能把它當純 node 執行，使用者不需要另外安裝 Node.js。
+        const batContent = `@echo off\r\nset ELECTRON_RUN_AS_NODE=1\r\n"${process.execPath}" "${jsPath}" %*\r\n`;
         fs.writeFileSync(batPath, batContent, 'utf-8');
         this.askPassScriptPath = batPath;
       } else {
