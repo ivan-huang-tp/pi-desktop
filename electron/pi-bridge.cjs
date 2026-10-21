@@ -4,6 +4,7 @@ const fs = require('fs');
 const os = require('os');
 const { randomBytes, randomUUID } = require('crypto');
 const { CoreManager } = require('./core-manager.cjs');
+const { SshManager } = require('./ssh-manager.cjs');
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -45,6 +46,7 @@ class PiProcess {
     this.convId = convId;
     this.workspace = workspace || process.cwd();
     this.requestedSessionFile = opts.sessionFile || null; // 要載入的既有對話（可為 null = 全新）
+    this.ssh = opts.ssh || null; // 若為遠端 SSH 專案，帶入 SshConfig
     this.process = null;
     this.buffer = '';
     this.pending = new Map(); // id -> { resolve, timer }
@@ -58,22 +60,26 @@ class PiProcess {
   }
 
   start() {
-    const core = this.bridge.activeCoreInfo || this.bridge.coreManager.resolveCore();
-    const env = { ...process.env };
-
-    // windowsHide 讓 Windows 不為子程序彈出 console 視窗；
-    // stderr 改用 pipe（不用 inherit）避免沿用父程序 console handle。
-    const spawnOpts = {
-      cwd: this.workspace,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env,
-      windowsHide: true,
-    };
-
-    if (core.cliPath) {
-      this.process = spawn('node', [core.cliPath, '--mode', 'rpc'], spawnOpts);
+    if (this.ssh) {
+      this.process = this.bridge.sshManager.spawnRemotePiRpc(this.ssh, this.workspace);
     } else {
-      this.process = spawn('cmd.exe', ['/c', 'pi', '--mode', 'rpc'], spawnOpts);
+      const core = this.bridge.activeCoreInfo || this.bridge.coreManager.resolveCore();
+      const env = { ...process.env };
+
+      // windowsHide 讓 Windows 不為子程序彈出 console 視窗；
+      // stderr 改用 pipe（不用 inherit）避免沿用父程序 console handle。
+      const spawnOpts = {
+        cwd: this.workspace,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env,
+        windowsHide: true,
+      };
+
+      if (core.cliPath) {
+        this.process = spawn('node', [core.cliPath, '--mode', 'rpc'], spawnOpts);
+      } else {
+        this.process = spawn('cmd.exe', ['/c', 'pi', '--mode', 'rpc'], spawnOpts);
+      }
     }
 
     this.process.stdout.on('data', (chunk) => this.onData(chunk));
@@ -110,7 +116,7 @@ class PiProcess {
       if (this.requestedSessionFile) {
         const res = await this.sendCommandAwait(
           { type: 'switch_session', sessionPath: this.requestedSessionFile },
-          15000
+          20000
         );
         if (!res || res.success === false) {
           console.error(`[PiProcess:${this.convId}] switch_session 失敗:`, res && res.error);
@@ -138,6 +144,8 @@ class PiProcess {
     for (const line of lines) {
       const trimmed = line.trim();
       if (!trimmed) continue;
+      // 忽略遠端 SSH 可能印出的登入橫幅 (MOTD) 等非 JSON 行
+      if (!trimmed.startsWith('{')) continue;
       let event;
       try {
         event = JSON.parse(trimmed);
@@ -282,7 +290,22 @@ class PiProcess {
   }
 
   refreshState() {
-    return this.sendCommandAwait({ type: 'get_state' }, 10000);
+    return this.sendCommandAwait({ type: 'get_state' }, this.ssh ? 20000 : 10000);
+  }
+
+  async reloadSession(sessionPath) {
+    const target = sessionPath || this.sessionFile || this.requestedSessionFile;
+    if (!target || this.disposed) return { success: false };
+    await this.ready;
+    if (this.disposed) return { success: false };
+    this.requestedSessionFile = target;
+    this.sessionFile = target;
+    const res = await this.sendCommandAwait(
+      { type: 'switch_session', sessionPath: target },
+      this.ssh ? 25000 : 15000
+    );
+    await this.refreshState();
+    return res;
   }
 
   async prompt(message, id) {
@@ -323,6 +346,7 @@ class PiBridge {
     this.mainWindow = mainWindow;
     this.app = app;
     this.coreManager = new CoreManager(app);
+    this.sshManager = new SshManager(app);
     this.processes = new Map(); // convId -> PiProcess
     this.reclaimTimers = new Map(); // convId -> Timeout
     this.currentWorkspace = process.cwd();
@@ -350,15 +374,21 @@ class PiBridge {
   /* ---- 程序生命週期 -------------------------------------------------- */
 
   ensureSession(convId, opts = {}) {
-    const { cwd, sessionFile } = opts;
+    const { cwd, sessionFile, ssh } = opts;
     const existing = this.processes.get(convId);
-    if (existing && !existing.disposed && existing.requestedSessionFile === (sessionFile || null)) {
+    if (
+      existing &&
+      !existing.disposed &&
+      (existing.requestedSessionFile === (sessionFile || null) ||
+        (sessionFile && existing.sessionFile === sessionFile))
+    ) {
+      if (sessionFile) existing.requestedSessionFile = sessionFile;
       this.cancelReclaim(convId);
       return existing;
     }
     if (existing) existing.dispose();
 
-    const proc = new PiProcess(this, convId, cwd || this.currentWorkspace, { sessionFile });
+    const proc = new PiProcess(this, convId, cwd || this.currentWorkspace, { sessionFile, ssh });
     this.processes.set(convId, proc);
     proc.start();
     return proc;
@@ -382,10 +412,10 @@ class PiBridge {
     };
   }
 
-  async prompt(convId, { message, id, cwd, sessionFile }) {
+  async prompt(convId, { message, id, cwd, sessionFile, ssh }) {
     let proc = this.processes.get(convId);
     if (!proc || proc.disposed) {
-      proc = this.ensureSession(convId, { cwd, sessionFile });
+      proc = this.ensureSession(convId, { cwd, sessionFile, ssh });
     }
     // 等初始化（spawn / switch_session / get_state）完成，避免訊息送到錯誤的會話
     await proc.ready;
@@ -559,88 +589,206 @@ class PiBridge {
     }
   }
 
-  // 讀取真實的 Sessions (依 ~/.pi/agent/sessions 下的 .jsonl)
-  listRealSessions() {
+  // 讀取真實的 Sessions (依本機 ~/.pi/agent/sessions 以及已設定的 SSH 遠端專案)
+  async listRealSessions() {
     const sessionsDir = path.join(os.homedir(), '.pi', 'agent', 'sessions');
-    if (!fs.existsSync(sessionsDir)) return [];
-
     const projects = [];
-    try {
-      const dirs = fs.readdirSync(sessionsDir);
-      for (const dirName of dirs) {
-        const fullDirPath = path.join(sessionsDir, dirName);
-        try {
-          if (!fs.statSync(fullDirPath).isDirectory()) continue;
-        } catch (e) { continue; }
 
-        const sessionFiles = fs.readdirSync(fullDirPath).filter(f => f.endsWith('.jsonl'));
-        if (sessionFiles.length === 0) continue;
+    if (fs.existsSync(sessionsDir)) {
+      try {
+        const dirs = fs.readdirSync(sessionsDir);
+        for (const dirName of dirs) {
+          const fullDirPath = path.join(sessionsDir, dirName);
+          try {
+            if (!fs.statSync(fullDirPath).isDirectory()) continue;
+          } catch (e) { continue; }
 
-        let cwd = null;
-        const sessions = [];
+          const sessionFiles = fs.readdirSync(fullDirPath).filter(f => f.endsWith('.jsonl'));
+          if (sessionFiles.length === 0) continue;
 
-        for (const file of sessionFiles) {
-          const full = path.join(fullDirPath, file);
-          const meta = this.readSessionMeta(full);
-          if (!cwd && meta.cwd) cwd = meta.cwd;
+          let cwd = null;
+          const sessions = [];
 
-          let stats;
-          try { stats = fs.statSync(full); } catch (e) { continue; }
+          for (const file of sessionFiles) {
+            const full = path.join(fullDirPath, file);
+            const meta = this.readSessionMeta(full);
+            if (!cwd && meta.cwd) cwd = meta.cwd;
 
-          const rawTitle = (meta.name || meta.firstUser || '').replace(/\s+/g, ' ').trim();
-          sessions.push({
-            id: full,
-            filePath: full,
-            projectId: null,
-            title: rawTitle ? rawTitle.slice(0, 60) : file.replace(/\.jsonl$/, ''),
-            timeAgo: timeAgo(stats.mtimeMs),
-            updatedAt: stats.mtimeMs,
+            let stats;
+            try { stats = fs.statSync(full); } catch (e) { continue; }
+
+            const rawTitle = (meta.name || meta.firstUser || '').replace(/\s+/g, ' ').trim();
+            sessions.push({
+              id: full,
+              filePath: full,
+              projectId: null,
+              title: rawTitle ? rawTitle.slice(0, 60) : file.replace(/\.jsonl$/, ''),
+              timeAgo: timeAgo(stats.mtimeMs),
+              updatedAt: stats.mtimeMs,
+            });
+          }
+
+          sessions.sort((a, b) => b.updatedAt - a.updatedAt);
+          if (!cwd) cwd = this.decodeDirName(dirName);
+          sessions.forEach(s => { s.projectId = cwd; });
+
+          projects.push({
+            id: cwd,
+            name: path.basename(cwd) || dirName,
+            path: cwd,
+            sessions,
           });
         }
-
-        sessions.sort((a, b) => b.updatedAt - a.updatedAt);
-        if (!cwd) cwd = this.decodeDirName(dirName);
-        sessions.forEach(s => { s.projectId = cwd; });
-
-        projects.push({
-          id: cwd,
-          name: path.basename(cwd) || dirName,
-          path: cwd,
-          sessions,
-        });
+      } catch (e) {
+        console.error('[PiBridge] 讀取本機 Sessions 失敗:', e);
       }
-    } catch (e) {
-      console.error('[PiBridge] 讀取 Sessions 失敗:', e);
     }
 
-    projects.sort((a, b) => (b.sessions[0]?.updatedAt || 0) - (a.sessions[0]?.updatedAt || 0));
+    // 載入已儲存的 SSH 遠端專案並拉取遠端歷史 Sessions
+    try {
+      const savedSshProjects = this.sshManager.getSavedProjects();
+      if (savedSshProjects.length > 0) {
+        const hostMap = new Map();
+        for (const sp of savedSshProjects) {
+          if (sp.ssh && sp.ssh.id) {
+            if (!hostMap.has(sp.ssh.id)) hostMap.set(sp.ssh.id, sp.ssh);
+          }
+        }
+
+        const remoteByHost = new Map();
+        await Promise.all(
+          Array.from(hostMap.entries()).map(async ([hostId, sshCfg]) => {
+            try {
+              const list = await this.sshManager.listRemoteSessionsForHost(sshCfg);
+              remoteByHost.set(hostId, list || []);
+            } catch (e) {
+              console.warn(`[PiBridge] 讀取遠端 (${hostId}) Sessions 失敗:`, e.message);
+              remoteByHost.set(hostId, []);
+            }
+          })
+        );
+
+        const normPosix = (p) => String(p || '').replace(/\\/g, '/').replace(/\/+$/, '') || '/';
+        for (const sp of savedSshProjects) {
+          if (!sp.ssh || !sp.ssh.id) continue;
+          const remoteList = remoteByHost.get(sp.ssh.id) || [];
+          const match = remoteList.find((rp) => normPosix(rp.path) === normPosix(sp.path));
+          const sessions = match ? match.sessions.map(s => ({ ...s, projectId: sp.id, ssh: sp.ssh })) : [];
+          projects.push({
+            id: sp.id,
+            name: sp.name || path.posix.basename(normPosix(sp.path)) || sp.path,
+            path: normPosix(sp.path),
+            ssh: sp.ssh,
+            sessions,
+            addedAt: sp.addedAt || 0,
+          });
+        }
+      }
+    } catch (e) {
+      console.error('[PiBridge] 整合遠端 SSH 專案失敗:', e);
+    }
+
+    projects.sort((a, b) => {
+      const ta = a.sessions[0]?.updatedAt || a.addedAt || 0;
+      const tb = b.sessions[0]?.updatedAt || b.addedAt || 0;
+      return tb - ta;
+    });
     return projects;
   }
 
-  // 解析 .jsonl 成 UI 用的 Message[] (僅取目前作用中的分支)
-  loadSession(filePath) {
-    let content;
-    try {
-      content = fs.readFileSync(filePath, 'utf-8');
-    } catch (e) {
-      console.error('[PiBridge] 讀取會話檔失敗:', e);
-      return [];
-    }
-
+  // 解析 .jsonl 內容為結構化樹與當前分支資訊
+  _parseSessionData(content) {
     const entries = [];
+    let header = null;
     for (const line of content.split('\n')) {
       const t = line.trim();
       if (!t) continue;
       let e;
       try { e = JSON.parse(t); } catch (err) { continue; }
+      if (e.type === 'session' && !header) header = e;
       entries.push(e);
     }
 
     const byId = new Map();
-    entries.forEach(e => { if (e.id) byId.set(e.id, e); });
+    const labelsById = new Map();
+    const labelTimestampsById = new Map();
     let leaf = null;
-    for (let i = entries.length - 1; i >= 0; i--) {
-      if (entries[i].id) { leaf = entries[i]; break; }
+
+    for (const e of entries) {
+      if (e.type === 'session') continue;
+      if (e.id) {
+        byId.set(e.id, e);
+        leaf = e;
+      }
+      if (e.type === 'label' && e.targetId) {
+        if (e.label) {
+          labelsById.set(e.targetId, e.label);
+          labelTimestampsById.set(e.targetId, e.timestamp);
+        } else {
+          labelsById.delete(e.targetId);
+          labelTimestampsById.delete(e.targetId);
+        }
+      }
+    }
+
+    const isUserMessageEntry = (e) => {
+      if (!e || !e.id) return false;
+      if (e.type === 'message' && e.message && (e.message.role === 'user' || e.message.role === 'custom')) {
+        return extractText(e.message.content).trim().length > 0;
+      }
+      if (e.type === 'custom_message' && e.display !== false) {
+        return extractText(e.content).trim().length > 0;
+      }
+      return false;
+    };
+
+    // 計算每個使用者訊息的最近上層使用者訊息（用於歸類同層分支 < 1/N >）
+    // 以及每個使用者訊息子樹中的最新對話節點 leafId
+    const nearestUserAncestor = new Map();
+    const siblingsByParentUser = new Map();
+    const latestLeafByUserEntryId = new Map();
+
+    for (const e of entries) {
+      if (e.type === 'session' || !e.id) continue;
+
+      if (isUserMessageEntry(e)) {
+        let p = e.parentId ? byId.get(e.parentId) : null;
+        const visited = new Set([e.id]);
+        let ancestorUserId = null;
+        while (p && p.id && !visited.has(p.id)) {
+          visited.add(p.id);
+          if (isUserMessageEntry(p)) {
+            ancestorUserId = p.id;
+            break;
+          }
+          p = p.parentId ? byId.get(p.parentId) : null;
+        }
+        nearestUserAncestor.set(e.id, ancestorUserId);
+        if (!siblingsByParentUser.has(ancestorUserId)) {
+          siblingsByParentUser.set(ancestorUserId, []);
+        }
+        siblingsByParentUser.get(ancestorUserId).push(e);
+        if (!latestLeafByUserEntryId.has(e.id)) {
+          latestLeafByUserEntryId.set(e.id, e.id);
+        }
+      }
+
+      // 更新此節點所屬的所有上層 user entry 的最新對話 leafId（忽略書籤與游標節點）
+      const isBookkeeping =
+        e.type === 'label' ||
+        e.type === 'session_info' ||
+        (e.type === 'custom' && e.customType === 'pi-ui:branch');
+      if (!isBookkeeping) {
+        let cur = e;
+        const visited = new Set();
+        while (cur && cur.id && !visited.has(cur.id)) {
+          visited.add(cur.id);
+          if (isUserMessageEntry(cur)) {
+            latestLeafByUserEntryId.set(cur.id, e.id);
+          }
+          cur = cur.parentId ? byId.get(cur.parentId) : null;
+        }
+      }
     }
 
     const chain = [];
@@ -653,8 +801,41 @@ class PiBridge {
     }
     chain.reverse();
 
+    // 追蹤當前分支上的 context_edit
+    const contextEdits = new Map();
+    for (const e of chain) {
+      if (e.type === 'context_edit' && e.targetId) {
+        contextEdits.set(e.targetId, e.replacement);
+      }
+    }
+
     const messages = [];
     for (const entry of chain) {
+      if (entry.type === 'custom_message' && entry.display !== false) {
+        const text = extractText(entry.content).trim();
+        if (!text) continue;
+        const ts = Date.parse(entry.timestamp) || Date.now();
+        const parentUserKey = nearestUserAncestor.get(entry.id) ?? null;
+        const siblingGroup = siblingsByParentUser.get(parentUserKey) || [entry];
+        const branchIdx = siblingGroup.findIndex((s) => s.id === entry.id);
+        const siblingLeafIds = siblingGroup.map((s) => latestLeafByUserEntryId.get(s.id) || s.id);
+        const omitted = contextEdits.get(entry.id) === null;
+        const label = labelsById.get(entry.id);
+        messages.push({
+          id: entry.id,
+          parentId: entry.parentId ?? null,
+          role: 'user',
+          content: text,
+          timestamp: ts,
+          branchIndex: branchIdx >= 0 ? branchIdx + 1 : 1,
+          branchCount: siblingGroup.length,
+          siblingLeafIds: siblingGroup.length > 1 ? siblingLeafIds : undefined,
+          label: label || undefined,
+          omitted: omitted || undefined,
+        });
+        continue;
+      }
+
       if (entry.type !== 'message' || !entry.message) continue;
       const m = entry.message;
       const ts = m.timestamp || Date.parse(entry.timestamp) || Date.now();
@@ -662,7 +843,24 @@ class PiBridge {
       if (m.role === 'user' || m.role === 'custom') {
         const text = extractText(m.content).trim();
         if (!text) continue;
-        messages.push({ id: entry.id, role: 'user', content: text, timestamp: ts });
+        const parentUserKey = nearestUserAncestor.get(entry.id) ?? null;
+        const siblingGroup = siblingsByParentUser.get(parentUserKey) || [entry];
+        const branchIdx = siblingGroup.findIndex((s) => s.id === entry.id);
+        const siblingLeafIds = siblingGroup.map((s) => latestLeafByUserEntryId.get(s.id) || s.id);
+        const omitted = contextEdits.get(entry.id) === null;
+        const label = labelsById.get(entry.id);
+        messages.push({
+          id: entry.id,
+          parentId: entry.parentId ?? null,
+          role: 'user',
+          content: text,
+          timestamp: ts,
+          branchIndex: branchIdx >= 0 ? branchIdx + 1 : 1,
+          branchCount: siblingGroup.length,
+          siblingLeafIds: siblingGroup.length > 1 ? siblingLeafIds : undefined,
+          label: label || undefined,
+          omitted: omitted || undefined,
+        });
       } else if (m.role === 'assistant') {
         let text = '';
         let thinking = '';
@@ -684,19 +882,22 @@ class PiBridge {
           }
         }
         if (!text && !thinking && tools.length === 0) continue;
+        const omitted = contextEdits.get(entry.id) === null;
         messages.push({
           id: entry.id,
+          parentId: entry.parentId ?? null,
           role: 'assistant',
           content: text,
           thinking: thinking || undefined,
           tools: tools.length ? tools : undefined,
           parts: parts.length ? parts : undefined,
           timestamp: ts,
+          omitted: omitted || undefined,
         });
       } else if (m.role === 'toolResult') {
         const out = extractText(m.content);
         for (let i = messages.length - 1; i >= 0; i--) {
-          const found = messages[i].tools?.find(x => x.id === m.toolCallId);
+          const found = messages[i].tools?.find((x) => x.id === m.toolCallId);
           if (found) {
             found.output = out;
             found.status = m.isError ? 'failed' : 'completed';
@@ -708,11 +909,352 @@ class PiBridge {
       }
     }
 
-    return messages;
+    return {
+      header,
+      entries,
+      byId,
+      labelsById,
+      labelTimestampsById,
+      leaf,
+      chain,
+      messages,
+      isUserMessageEntry,
+    };
+  }
+
+  _genEntryId(byId) {
+    for (let i = 0; i < 100; i++) {
+      const id = randomBytes(4).toString('hex');
+      if (!byId || !byId.has(id)) return id;
+    }
+    return randomUUID().slice(0, 8);
+  }
+
+  // 在 chain 或 byId 中定位目標使用者訊息節點（支援暫時前端 ID 的 fallback）
+  _resolveTargetUserEntry(parsed, { entryId, userTurnIndex, messageText } = {}) {
+    const { byId, chain, isUserMessageEntry } = parsed;
+    if (entryId && byId.has(entryId)) {
+      return byId.get(entryId);
+    }
+    const userEntries = chain.filter(isUserMessageEntry);
+    if (typeof userTurnIndex === 'number' && userTurnIndex >= 0 && userTurnIndex < userEntries.length) {
+      return userEntries[userTurnIndex];
+    }
+    if (messageText) {
+      const targetText = String(messageText).trim();
+      for (let i = userEntries.length - 1; i >= 0; i--) {
+        const u = userEntries[i];
+        const t = extractText(u.type === 'custom_message' ? u.content : u.message?.content).trim();
+        if (t === targetText) return u;
+      }
+    }
+    return null;
+  }
+
+  _appendJsonlEntries(filePath, newEntries) {
+    if (!newEntries || newEntries.length === 0) return;
+    const content = fs.existsSync(filePath) ? fs.readFileSync(filePath, 'utf-8') : '';
+    const prefix = content.length > 0 && !content.endsWith('\n') ? '\n' : '';
+    const payload = prefix + newEntries.map((e) => JSON.stringify(e)).join('\n') + '\n';
+    fs.appendFileSync(filePath, payload, 'utf-8');
+  }
+
+  async _syncProcessSession(convId, filePath) {
+    if (!convId) return;
+    const proc = this.processes.get(convId);
+    if (proc && !proc.disposed) {
+      await proc.reloadSession(filePath);
+    }
+  }
+
+  // 解析 .jsonl 成 UI 用的 Message[] (僅取目前作用中的分支，含分支/書籤/Context 略過狀態)
+  async loadSession(filePath, ssh = null) {
+    if (ssh) {
+      return await this.sshManager.loadRemoteSession(ssh, filePath);
+    }
+    let content;
+    try {
+      content = fs.readFileSync(filePath, 'utf-8');
+    } catch (e) {
+      console.error('[PiBridge] 讀取會話檔失敗:', e);
+      return [];
+    }
+    return this._parseSessionData(content).messages;
+  }
+
+  // 1. 切換同層分支版本 (< 1/N >)
+  async switchBranch(filePath, targetLeafId, ssh = null, convId = null) {
+    if (ssh) {
+      const res = await this.sshManager.switchRemoteBranch(ssh, filePath, targetLeafId);
+      if (res.success) await this._syncProcessSession(convId, filePath);
+      return res;
+    }
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const parsed = this._parseSessionData(content);
+      if (targetLeafId !== null && !parsed.byId.has(targetLeafId)) {
+        return { success: false, error: `找不到分支節點: ${targetLeafId}` };
+      }
+      const cursorEntry = {
+        type: 'custom',
+        customType: 'pi-ui:branch',
+        id: this._genEntryId(parsed.byId),
+        parentId: targetLeafId ?? null,
+        timestamp: new Date().toISOString(),
+      };
+      this._appendJsonlEntries(filePath, [cursorEntry]);
+      await this._syncProcessSession(convId, filePath);
+      const messages = await this.loadSession(filePath, null);
+      return { success: true, messages };
+    } catch (e) {
+      console.error('[PiBridge] 切換分支失敗:', e);
+      return { success: false, error: e.message };
+    }
+  }
+
+  // 2. 將對話指標回溯到指定使用者訊息之前（供「編輯並重送」與「重新生成」使用）
+  async rewindBeforeEntry(filePath, targetSpec, ssh = null, convId = null) {
+    if (ssh) {
+      const res = await this.sshManager.rewindRemoteBeforeEntry(ssh, filePath, targetSpec);
+      if (res.success) await this._syncProcessSession(convId, filePath);
+      return res;
+    }
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const parsed = this._parseSessionData(content);
+      const userEntry = this._resolveTargetUserEntry(parsed, targetSpec);
+      if (!userEntry) {
+        return { success: false, error: '找不到目標訊息節點' };
+      }
+      const parentLeafId = userEntry.parentId ?? null;
+      const cursorEntry = {
+        type: 'custom',
+        customType: 'pi-ui:branch',
+        id: this._genEntryId(parsed.byId),
+        parentId: parentLeafId,
+        timestamp: new Date().toISOString(),
+      };
+      this._appendJsonlEntries(filePath, [cursorEntry]);
+      await this._syncProcessSession(convId, filePath);
+      const messages = await this.loadSession(filePath, null);
+      return { success: true, messages, rewoundToParentId: parentLeafId };
+    } catch (e) {
+      console.error('[PiBridge] 回溯訊息失敗:', e);
+      return { success: false, error: e.message };
+    }
+  }
+
+  // 3. 從指定使用者訊息所在回合結束處分叉出一個全新的對話檔 (Fork)
+  async forkFromEntry(filePath, targetSpec, ssh = null) {
+    if (ssh) {
+      return await this.sshManager.forkRemoteFromEntry(ssh, filePath, targetSpec);
+    }
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const parsed = this._parseSessionData(content);
+      const userEntry = this._resolveTargetUserEntry(parsed, targetSpec);
+      if (!userEntry) {
+        return { success: false, error: '找不到要分支的目標訊息節點' };
+      }
+
+      const { chain, header, labelsById, labelTimestampsById, isUserMessageEntry } = parsed;
+      const userIdx = chain.findIndex((e) => e.id === userEntry.id);
+      if (userIdx === -1) {
+        return { success: false, error: '目標訊息不在目前分支路徑上' };
+      }
+
+      // 包含此使用者訊息與該回合後續的 AI 回覆/工具紀錄（直到下一則使用者訊息前）
+      let turnEndIdx = userIdx;
+      for (let i = userIdx + 1; i < chain.length; i++) {
+        if (isUserMessageEntry(chain[i])) break;
+        if (chain[i].type === 'custom' && chain[i].customType === 'pi-ui:branch') continue;
+        turnEndIdx = i;
+      }
+
+      const rawSlice = chain.slice(0, turnEndIdx + 1);
+      const retainedEntries = [];
+      let prevId = null;
+      const usedIds = new Set();
+
+      for (const e of rawSlice) {
+        if (e.type === 'label' || (e.type === 'custom' && e.customType === 'pi-ui:branch')) {
+          continue;
+        }
+        const cloned = { ...e, parentId: prevId };
+        retainedEntries.push(cloned);
+        usedIds.add(cloned.id);
+        prevId = cloned.id;
+      }
+
+      const newSessionId = randomUUID();
+      const iso = new Date().toISOString();
+      const newHeader = {
+        type: 'session',
+        version: header?.version || 3,
+        id: newSessionId,
+        timestamp: iso,
+        cwd: header?.cwd || this.currentWorkspace,
+        parentSession: filePath,
+      };
+
+      // 保留該路徑上節點的書籤標籤
+      const labelEntries = [];
+      for (const [targetId, label] of labelsById.entries()) {
+        if (usedIds.has(targetId) && label) {
+          const lblId = this._genEntryId(usedIds);
+          usedIds.add(lblId);
+          labelEntries.push({
+            type: 'label',
+            id: lblId,
+            parentId: prevId,
+            timestamp: labelTimestampsById.get(targetId) || iso,
+            targetId,
+            label,
+          });
+          prevId = lblId;
+        }
+      }
+
+      // 替新分支對話加上清楚的名稱後綴
+      const meta = this.readSessionMeta(filePath);
+      const baseTitle = (meta.name || meta.firstUser || '對話').replace(/\s+/g, ' ').trim().slice(0, 45);
+      const infoId = this._genEntryId(usedIds);
+      const infoEntry = {
+        type: 'session_info',
+        id: infoId,
+        parentId: prevId,
+        timestamp: iso,
+        name: `${baseTitle} (分支)`,
+      };
+
+      const outLines = [
+        JSON.stringify(newHeader),
+        ...retainedEntries.map((e) => JSON.stringify(e)),
+        ...labelEntries.map((e) => JSON.stringify(e)),
+        JSON.stringify(infoEntry),
+      ];
+
+      const stamp = iso.replace(/[:.]/g, '-');
+      const newPath = path.join(path.dirname(filePath), `${stamp}_${newSessionId}.jsonl`);
+      fs.writeFileSync(newPath, outLines.join('\n') + '\n', 'utf-8');
+      return { success: true, path: newPath };
+    } catch (e) {
+      console.error('[PiBridge] 分支對話失敗:', e);
+      return { success: false, error: e.message };
+    }
+  }
+
+  // 4. 設定或清除單一訊息的書籤標籤 (LabelEntry)
+  async setEntryLabel(filePath, targetSpec, ssh = null, convId = null) {
+    if (ssh) {
+      const res = await this.sshManager.setRemoteEntryLabel(ssh, filePath, targetSpec);
+      if (res.success) await this._syncProcessSession(convId, filePath);
+      return res;
+    }
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const parsed = this._parseSessionData(content);
+      const userEntry = this._resolveTargetUserEntry(parsed, targetSpec);
+      if (!userEntry) {
+        return { success: false, error: '找不到要標記書籤的訊息節點' };
+      }
+      const cleanLabel = targetSpec.label ? String(targetSpec.label).trim() : undefined;
+      const labelEntry = {
+        type: 'label',
+        id: this._genEntryId(parsed.byId),
+        parentId: parsed.leaf ? parsed.leaf.id : null,
+        timestamp: new Date().toISOString(),
+        targetId: userEntry.id,
+        label: cleanLabel || undefined,
+      };
+      this._appendJsonlEntries(filePath, [labelEntry]);
+      await this._syncProcessSession(convId, filePath);
+      const messages = await this.loadSession(filePath, null);
+      return { success: true, messages };
+    } catch (e) {
+      console.error('[PiBridge] 設定書籤失敗:', e);
+      return { success: false, error: e.message };
+    }
+  }
+
+  // 5. 切換是否將此使用者訊息及其回合從 AI 上下文記憶中略過 (ContextEditEntry)
+  async toggleContextOmit(filePath, targetSpec, ssh = null, convId = null) {
+    if (ssh) {
+      const res = await this.sshManager.toggleRemoteContextOmit(ssh, filePath, targetSpec);
+      if (res.success) await this._syncProcessSession(convId, filePath);
+      return res;
+    }
+    try {
+      const content = fs.readFileSync(filePath, 'utf-8');
+      const parsed = this._parseSessionData(content);
+      const userEntry = this._resolveTargetUserEntry(parsed, targetSpec);
+      if (!userEntry) {
+        return { success: false, error: '找不到目標訊息節點' };
+      }
+
+      const { chain, byId, isUserMessageEntry } = parsed;
+      const userIdx = chain.findIndex((e) => e.id === userEntry.id);
+      if (userIdx === -1) {
+        return { success: false, error: '目標訊息不在目前分支路徑上' };
+      }
+
+      // 收集此回合內所有可透過 context_edit 編輯的訊息（user + assistant + toolResult）
+      const turnEditableEntries = [];
+      for (let i = userIdx; i < chain.length; i++) {
+        if (i > userIdx && isUserMessageEntry(chain[i])) break;
+        const e = chain[i];
+        const editable =
+          e.type === 'custom_message' ||
+          (e.type === 'message' &&
+            e.message &&
+            (e.message.role === 'user' || e.message.role === 'assistant' || e.message.role === 'toolResult'));
+        if (editable) turnEditableEntries.push(e);
+      }
+
+      const omit = !!targetSpec.omit;
+      const iso = new Date().toISOString();
+      let curParentId = parsed.leaf ? parsed.leaf.id : null;
+      const newEditEntries = [];
+
+      for (const e of turnEditableEntries) {
+        const editId = this._genEntryId(byId);
+        byId.set(editId, true);
+        let replacement = null;
+        if (!omit) {
+          const rawContent = e.type === 'custom_message' ? e.content : e.message.content;
+          const role = e.type === 'message' ? e.message.role : 'custom';
+          const normalizedContent =
+            (role === 'assistant' || role === 'toolResult') && typeof rawContent === 'string'
+              ? [{ type: 'text', text: rawContent }]
+              : rawContent;
+          replacement = { content: normalizedContent };
+        }
+        newEditEntries.push({
+          type: 'context_edit',
+          id: editId,
+          parentId: curParentId,
+          timestamp: iso,
+          targetId: e.id,
+          replacement,
+        });
+        curParentId = editId;
+      }
+
+      this._appendJsonlEntries(filePath, newEditEntries);
+      await this._syncProcessSession(convId, filePath);
+      const messages = await this.loadSession(filePath, null);
+      return { success: true, messages };
+    } catch (e) {
+      console.error('[PiBridge] 切換 Context 略過狀態失敗:', e);
+      return { success: false, error: e.message };
+    }
   }
 
   // 重新命名對話：對 .jsonl 追加一筆標準 session_info entry
-  renameSession(filePath, name) {
+  async renameSession(filePath, name, ssh = null) {
+    if (ssh) {
+      return await this.sshManager.renameRemoteSession(ssh, filePath, name);
+    }
     try {
       let content = fs.readFileSync(filePath, 'utf-8');
       if (!content.endsWith('\n')) {
@@ -745,7 +1287,10 @@ class PiBridge {
   }
 
   // 複製整個對話
-  duplicateSession(filePath) {
+  async duplicateSession(filePath, ssh = null) {
+    if (ssh) {
+      return await this.sshManager.duplicateRemoteSession(ssh, filePath);
+    }
     try {
       const content = fs.readFileSync(filePath, 'utf-8');
       const newId = randomUUID();
@@ -780,7 +1325,10 @@ class PiBridge {
   }
 
   // 匯出 JSONL：直接複製原始檔
-  copySessionFile(filePath, outputPath) {
+  async copySessionFile(filePath, outputPath, ssh = null) {
+    if (ssh) {
+      return await this.sshManager.exportRemoteSession(ssh, filePath, 'jsonl', outputPath);
+    }
     try {
       fs.copyFileSync(filePath, outputPath);
       return { success: true, path: outputPath };
@@ -791,7 +1339,10 @@ class PiBridge {
   }
 
   // 匯出 HTML：用 Pi 官方 CLI `--export <來源> <目標>`
-  exportSessionHtml(filePath, outputPath) {
+  async exportSessionHtml(filePath, outputPath, ssh = null) {
+    if (ssh) {
+      return await this.sshManager.exportRemoteSession(ssh, filePath, 'html', outputPath);
+    }
     return new Promise((resolve) => {
       const core = this.activeCoreInfo || this.coreManager.resolveCore();
       const meta = this.readSessionMeta(filePath);

@@ -9,7 +9,8 @@ import {
   Settings, 
   Terminal,
   FolderOpen,
-  Cpu
+  Cpu,
+  Server
 } from 'lucide-react';
 import type { Project, Session, CoreInfo } from '../types';
 
@@ -19,6 +20,7 @@ interface SidebarProps {
   onSelectSession: (session: Session, project?: Project) => void;
   onNewSession: (projectId?: string) => void;
   onOpenFolder: () => void;
+  onOpenSshModal?: () => void;
   coreInfo?: CoreInfo | null;
   onOpenCoreManager?: () => void;
   onOpenModelSettings?: () => void;
@@ -40,6 +42,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onSelectSession,
   onNewSession,
   onOpenFolder,
+  onOpenSshModal,
   coreInfo,
   onOpenCoreManager,
   onOpenModelSettings,
@@ -106,32 +109,39 @@ export const Sidebar: React.FC<SidebarProps> = ({
       >
         {/* Projects 區塊 */}
         <div className="mb-4">
-          <div className="flex items-center justify-between px-2 mb-1.5 text-[15px] font-semibold text-zinc-400">
-            <span className="text-[15px] font-medium text-zinc-300">Projects</span>
-            <div className="flex items-center space-x-2">
+          <div className="flex items-center justify-between px-2 mb-2 text-[15.5px] font-semibold text-zinc-400">
+            <span className="text-[15.5px] font-medium text-zinc-300">Projects</span>
+            <div className="flex items-center space-x-1.5">
               <button 
                 title="Filter projects" 
                 className="hover:text-zinc-100 p-1 rounded hover:bg-zinc-800 transition"
               >
-                <Filter size={14} />
+                <Filter size={15} />
               </button>
               <button 
-                title="Open Folder / Add Project" 
+                title="新增 SSH 遠端專案 (Native SSH)" 
+                onClick={onOpenSshModal}
+                className="text-cyan-400 hover:text-cyan-300 p-1 rounded hover:bg-zinc-800 transition"
+              >
+                <Server size={15} />
+              </button>
+              <button 
+                title="Open Folder / Add Local Project" 
                 onClick={onOpenFolder}
                 className="hover:text-zinc-100 p-1 rounded hover:bg-zinc-800 transition"
               >
-                <FolderPlus size={15} />
+                <FolderPlus size={16} />
               </button>
             </div>
           </div>
 
           {/* 專案列表 */}
-          <div className="space-y-[4.5px]">
+          <div className="space-y-1">
             {projects.map((project) => {
               // 預設只展開最新對話所在的專案，其餘收合
               const isExpanded = expandedProjects[project.id] ?? (project.id === mostRecentProjectId && !!project.sessions.length);
               return (
-                <div key={project.id} className="text-[15px]">
+                <div key={project.id} className="text-[16.5px]">
                   {/* 專案資料夾名稱 */}
                   <div
                     onClick={() => toggleProject(project.id)}
@@ -140,25 +150,35 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       e.stopPropagation();
                       onProjectContextMenu?.(project, e.clientX, e.clientY);
                     }}
-                    className="flex items-center space-x-3 px-2 py-[4.5px] rounded-md cursor-pointer hover:bg-zinc-800/60 transition group text-zinc-300"
+                    title={project.ssh ? `[SSH] ${project.ssh.host}:${project.path}` : project.path}
+                    className="flex items-center space-x-2.5 px-2.5 py-1.5 rounded-md cursor-pointer hover:bg-zinc-800/60 transition group text-zinc-300"
                   >
-                    <Folder size={15} className="text-zinc-400 group-hover:text-zinc-200" />
+                    {project.ssh ? (
+                      <Server size={16} className="text-cyan-400 group-hover:text-cyan-300 shrink-0" />
+                    ) : (
+                      <Folder size={16} className="text-zinc-400 group-hover:text-zinc-200 shrink-0" />
+                    )}
                     <span className="font-medium flex-1 truncate">{project.name}</span>
+                    {project.ssh && (
+                      <span className="text-[11px] px-1.5 py-0.5 rounded bg-cyan-500/15 text-cyan-300 border border-cyan-500/30 font-mono shrink-0">
+                        SSH
+                      </span>
+                    )}
                     <button 
                       onClick={(e) => {
                         e.stopPropagation();
                         onNewSession(project.id);
                       }}
                       title="New chat in this project"
-                      className="opacity-0 group-hover:opacity-100 hover:text-zinc-100 p-0.5 rounded transition"
+                      className="opacity-0 group-hover:opacity-100 hover:text-zinc-100 p-0.5 rounded transition shrink-0"
                     >
-                      <Plus size={13} />
+                      <Plus size={14} />
                     </button>
                   </div>
 
                   {/* 專案底下的 Sessions 列表 */}
                   {isExpanded && (
-                    <div className="mt-0.5 space-y-[4.5px]">
+                    <div className="mt-0.5 space-y-1">
                       {project.sessions.map((session) => {
                         const isActive = session.id === activeSessionId;
                         return (
@@ -171,14 +191,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
                               onSessionContextMenu?.(session, project, e.clientX, e.clientY);
                             }}
                             title={session.filePath || session.title}
-                            className={`flex items-center justify-between px-2 py-[4.5px] rounded-md cursor-pointer text-[15px] transition group ${
+                            className={`flex items-center justify-between px-2.5 py-1.5 rounded-md cursor-pointer text-[16.5px] transition group ${
                               isActive
                                 ? 'bg-zinc-700/60 text-zinc-100 font-medium'
                                 : 'text-zinc-400 hover:bg-zinc-800/50 hover:text-zinc-200'
                             }`}
                           >
                             <span className="truncate pr-2">{session.title}</span>
-                            <span className="text-[13px] text-zinc-500 whitespace-nowrap group-hover:text-zinc-400">
+                            <span className="text-[12px] text-zinc-500 whitespace-nowrap group-hover:text-zinc-400">
                               {session.timeAgo}
                             </span>
                           </div>

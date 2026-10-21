@@ -1,9 +1,43 @@
+export interface SshConfig {
+  id: string;        // 唯一識別，例如 "user@192.168.1.50:22"
+  host: string;      // "user@host" 或 ~/.ssh/config 別名
+  port?: number;     // 預設 22
+  password?: string; // 選填；留空走 SSH Key，有填走 SSH_ASKPASS
+  label?: string;    // 選填顯示別名
+}
+
+export interface RemoteDirEntry {
+  name: string;
+  path: string;
+}
+
+export interface DiscoveredRemoteProject {
+  path: string;
+  name: string;
+  sessionCount: number;
+  updatedAt: number;
+}
+
+export interface RemoteBrowseResult {
+  success: boolean;
+  error?: string;
+  currentPath?: string;
+  parentPath?: string | null;
+  homeDir?: string;
+  directories?: RemoteDirEntry[];
+  discoveredProjects?: DiscoveredRemoteProject[];
+  piAvailable?: boolean;
+  piPath?: string | null;
+  nodeVersion?: string;
+}
+
 export interface Project {
   id: string;
   name: string;
   path: string;
   sessions: Session[];
   isExpanded?: boolean;
+  ssh?: SshConfig;
 }
 
 export interface Session {
@@ -13,6 +47,7 @@ export interface Session {
   timeAgo: string;
   updatedAt: number;
   filePath?: string;
+  ssh?: SshConfig;
 }
 
 export type Role = 'user' | 'assistant' | 'system';
@@ -81,6 +116,13 @@ export interface Message {
   subagents?: SubagentTask[];
   // 依時間順序排列的內容片段（新資料來源；渲染時優先使用）
   parts?: MessagePart[];
+  // Session Tree 分支與單一訊息操作中繼資料
+  parentId?: string | null;
+  branchIndex?: number;       // 1-based，目前位於第幾個同層分支
+  branchCount?: number;       // 同層分支總數（> 1 時顯示分支切換器）
+  siblingLeafIds?: string[];  // 每個同層分支對應的最新 leaf entryId
+  label?: string;             // 書籤標籤 (LabelEntry)
+  omitted?: boolean;          // 是否已透過 ContextEditEntry 從 AI 上下文略過
 }
 
 export interface FileItem {
@@ -89,6 +131,28 @@ export interface FileItem {
   isDirectory: boolean;
   children?: FileItem[];
   size?: number;
+  mtimeMs?: number;
+  isHidden?: boolean;
+}
+
+export interface DirectoryReadResult {
+  success: boolean;
+  error?: string;
+  currentPath: string;
+  parentPath: string | null;
+  items: FileItem[];
+}
+
+export interface FileReadResult {
+  success: boolean;
+  error?: string;
+  filePath: string;
+  name: string;
+  kind: 'text' | 'image' | 'binary';
+  content?: string;
+  dataUrl?: string;
+  size: number;
+  truncated?: boolean;
 }
 
 export interface CoreInfo {

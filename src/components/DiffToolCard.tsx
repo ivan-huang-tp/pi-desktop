@@ -76,7 +76,10 @@ const lineStyle: Record<DiffLineKind, string> = {
 
 const lineSign: Record<DiffLineKind, string> = { add: '+', del: '-', ctx: ' ', skip: ' ' };
 
-export const DiffToolCard: React.FC<{ tool: ToolCall }> = ({ tool }) => {
+export const DiffToolCard: React.FC<{
+  tool: ToolCall;
+  onOpenPath?: (path: string) => void;
+}> = ({ tool, onOpenPath }) => {
   const [open, setOpen] = useState(false);
 
   const path: string =
@@ -96,28 +99,57 @@ export const DiffToolCard: React.FC<{ tool: ToolCall }> = ({ tool }) => {
   const Icon = tool.name === 'write' ? FilePlus : FilePen;
 
   return (
-    <div className="overflow-hidden">
-      <button
+    <div className="w-full max-w-full min-w-0 overflow-hidden">
+      <div
+        role="button"
+        tabIndex={0}
         onClick={() => setOpen((v) => !v)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' || e.key === ' ') {
+            e.preventDefault();
+            setOpen((v) => !v);
+          }
+        }}
         title={open ? '收合' : '展開 diff'}
-        className="w-full py-1 flex items-center space-x-2 text-zinc-300 text-sm text-left font-mono"
+        className="w-full py-1 flex items-center space-x-2 text-zinc-300 text-sm text-left font-mono hover:text-zinc-100 transition-colors cursor-pointer select-none"
       >
         <Icon size={13} className="text-sky-400 shrink-0" />
-        <span className="text-purple-400 font-semibold shrink-0">{tool.name}</span>
-        <span className="flex-1 min-w-0 truncate text-zinc-400" title={path}>
-          {path}
-        </span>
-        {added > 0 && <span className="text-xs text-emerald-400 shrink-0">+{added}</span>}
-        {removed > 0 && <span className="text-xs text-rose-400 shrink-0">-{removed}</span>}
+        <span className="shrink-0 text-sky-400 font-semibold">{tool.name}</span>
+        {path ? (
+          <span
+            role="button"
+            tabIndex={0}
+            onClick={(e) => {
+              if (onOpenPath) {
+                e.stopPropagation();
+                onOpenPath(path);
+              }
+            }}
+            onKeyDown={(e) => {
+              if ((e.key === 'Enter' || e.key === ' ') && onOpenPath) {
+                e.preventDefault();
+                e.stopPropagation();
+                onOpenPath(path);
+              }
+            }}
+            title={path}
+            className="truncate text-zinc-500 hover:text-zinc-200 transition-colors cursor-pointer text-left"
+          >
+            {path}
+          </span>
+        ) : null}
+        <span className="flex-1 min-w-0" />
+        {added > 0 && <span className="text-xs text-emerald-400 shrink-0 font-mono">+{added}</span>}
+        {removed > 0 && <span className="text-xs text-rose-400 shrink-0 font-mono">-{removed}</span>}
         {(running || failed) && (
-          <span className={`text-xs shrink-0 ${failed ? 'text-rose-400' : 'text-amber-400'}`}>
+          <span className={`text-xs shrink-0 font-mono ${failed ? 'text-rose-400' : 'text-amber-400'}`}>
             {tool.status}
           </span>
         )}
-        <span className="shrink-0">
+        <span className="ml-auto shrink-0 text-zinc-500 pl-1">
           {open ? <ChevronDown size={13} /> : <ChevronRight size={13} />}
         </span>
-      </button>
+      </div>
 
       {open && (
         <div className="ml-5 mr-1.5 mb-1 rounded-md border border-[#2a2a30] bg-[#0e0e10] overflow-hidden">

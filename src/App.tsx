@@ -4,13 +4,14 @@ import { ChatArea } from './components/ChatArea';
 import { RightPanel, RightPanelTab } from './components/RightPanel';
 import { CoreManagerModal } from './components/CoreManagerModal';
 import { ModelSettingsModal } from './components/ModelSettingsModal';
+import { SshModal } from './components/SshModal';
 import { ContextMenu, ContextMenuItem } from './components/ContextMenu';
 import { ResizeHandle } from './components/ResizeHandle';
 import {
   Play, Pencil, CopyPlus, Download, FileCode, FileJson, Clipboard as ClipboardIcon,
-  Trash2, FolderOpen, Plus, RefreshCw, FolderPlus, ChevronsUpDown, AlertTriangle,
+  Trash2, FolderOpen, Plus, RefreshCw, FolderPlus, ChevronsUpDown, AlertTriangle, Server,
 } from 'lucide-react';
-import type { Project, Session, Message, FileItem, SubagentTask, ToolCall, CoreInfo, BashCommand, SessionLog } from './types';
+import type { Project, Session, Message, FileItem, SubagentTask, ToolCall, CoreInfo, BashCommand, SessionLog, SshConfig } from './types';
 import {
   appendAssistantDelta,
   appendToolPart,
@@ -142,8 +143,10 @@ export const App: React.FC = () => {
     return () => window.removeEventListener('resize', onWindowResize);
   }, []);
 
-  // 3. 檔案樹
-  const [files, setFiles] = useState<FileItem[]>([]);
+  // 3. 檔案樹與重整觸發器（由 FileTree 自行管理目前瀏覽目錄，此處提供外部觸發重整）
+  const [files] = useState<FileItem[]>([]);
+  const [fileRefreshTrigger, setFileRefreshTrigger] = useState<number>(0);
+  const [revealFileRequest, setRevealFileRequest] = useState<{ path: string; nonce: number } | null>(null);
 
   // 4. 連線/核心訊息（全域）
   const [sessionLogs, setSessionLogs] = useState<SessionLog[]>([
@@ -164,6 +167,7 @@ export const App: React.FC = () => {
   const [coreInfo, setCoreInfo] = useState<CoreInfo | null>(null);
   const [isCoreManagerOpen, setIsCoreManagerOpen] = useState(false);
   const [isModelSettingsOpen, setIsModelSettingsOpen] = useState(false);
+  const [isSshModalOpen, setIsSshModalOpen] = useState(false);
 
   // 6. 右鍵選單 / 對話管理彈窗 / 提示
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; items: ContextMenuItem[] } | null>(null);
@@ -213,32 +217,26 @@ export const App: React.FC = () => {
     setLoadingByConv(prev => (prev[convId] === value ? prev : { ...prev, [convId]: value }));
   }, []);
 
-  // 載入真實的專案檔案樹與歷史 Sessions
-  const loadWorkspaceFiles = async (workspacePath?: string) => {
-    if (ipcRenderer) {
-      try {
-        const tree = await ipcRenderer.invoke('fs:read-directory', workspacePath || currentProjectRef.current.path);
-        setFiles(tree);
-      } catch (e) {
-        console.error('讀取檔案樹失敗:', e);
-      }
-    }
+  // 通知右側檔案瀏覽器重新整理當前目錄
+  const loadWorkspaceFiles = async (_workspacePath?: string, _sshOverride?: SshConfig | null) => {
+    setFileRefreshTrigger((n) => n + 1);
   };
 
   // 路徑正規化，用於合併「寫死的當前專案」與「磁碟讀到的真實專案」
   const normPath = (p?: string) => (p || '').toLowerCase().replace(/\//g, '\\').replace(/\\+$/, '');
+  const projectKey = (p: Project) => (p.ssh ? p.id : normPath(p.path));
 
   const loadRealProjects = async (): Promise<Project[]> => {
     if (!ipcRenderer) return [];
     try {
       const realProjects: Project[] = (await ipcRenderer.invoke('pi:get-real-projects')) || [];
       const map = new Map<string, Project>();
-      // 磁碟為唯一真實來源：直接以 rp.sessions 為準（可正確反映新增/刪除）
-      realProjects.forEach(rp => map.set(normPath(rp.path), rp));
-      // 磁碟上已無任何會話的專案（例如對話被刪到一個不剩）→ 保留專案但清空 sessions，
-      // 避免舊的（已刪除的）對話殘留在畫面上；純本機草稿工作區也一併保留。
+      // 磁碟與遠端為真實來源：直接以 rp.sessions 為準（可正確反映新增/刪除）
+      realProjects.forEach(rp => map.set(projectKey(rp), rp));
+      // 磁碟上已無任何會話的本機草稿工作區一併保留
       projectsRef.current.forEach(p => {
-        const key = normPath(p.path);
+        if (p.ssh) return; // 遠端專案由 ssh-projects.json 決定存留
+        const key = projectKey(p);
         if (!map.has(key)) map.set(key, { ...p, sessions: [] });
       });
       // 依最新對話時間排序，最新的專案排在最上面
@@ -253,16 +251,18 @@ export const App: React.FC = () => {
     }
   };
 
-  // 新對話送出第一則訊息後，Pi 才會落地 .jsonl；此時把它選取起來
-  const settlePendingSession = useCallback(async (convId: string) => {
+  // 新對話送出第一則訊息後，Pi 才會落地 .jsonl；此時把它選取起來，並在回合結算時同步 .jsonl 內的真實 entryId 與分支資訊
+  const settlePendingSession = useCallback(async (convId: string, syncHistory = false) => {
     if (!convId || !ipcRenderer) return;
     let file = convFileByIdRef.current[convId];
+    const ssh = currentProjectRef.current.ssh;
     // 新對話：向子程序問出剛落地的 session 檔名
     if (!file) {
       try {
         const info = await ipcRenderer.invoke('pi:ensure-session', {
           convId,
           cwd: currentProjectRef.current.path,
+          ssh,
           sessionFile: undefined,
         });
         file = info?.sessionFile || undefined;
@@ -276,10 +276,54 @@ export const App: React.FC = () => {
     }
     if (!file) return;
     const list = await loadRealProjects();
-    if (list.some(p => p.sessions.some(s => s.filePath === file))) {
-      if (activeConvIdRef.current === convId) setActiveSessionId(file);
+    let matchedSessionId: string | undefined;
+    for (const p of list) {
+      const found = p.sessions.find(s => s.filePath === file);
+      if (found) {
+        matchedSessionId = found.id;
+        break;
+      }
     }
-  }, []);
+    if (matchedSessionId && activeConvIdRef.current === convId) {
+      setActiveSessionId(matchedSessionId);
+    }
+
+    if (syncHistory) {
+      try {
+        const history: Message[] = await ipcRenderer.invoke(
+          'pi:load-session',
+          ssh ? { filePath: file, ssh } : file
+        );
+        if (Array.isArray(history) && history.length > 0) {
+          updateConvMessages(convId, prev => {
+            // 保留即時串流時掛在 assistant 訊息上的 subagents 紀錄
+            const subagentsByIdx = new Map<number, SubagentTask[]>();
+            let aiIdx = 0;
+            for (const m of prev) {
+              if (m.role === 'assistant') {
+                if (m.subagents && m.subagents.length > 0) {
+                  subagentsByIdx.set(aiIdx, m.subagents);
+                }
+                aiIdx++;
+              }
+            }
+            let nextAiIdx = 0;
+            return history.map(m => {
+              if (m.role === 'assistant') {
+                const subs = subagentsByIdx.get(nextAiIdx++);
+                if (subs && (!m.subagents || m.subagents.length === 0)) {
+                  return { ...m, subagents: subs };
+                }
+              }
+              return m;
+            });
+          });
+        }
+      } catch (e) {
+        /* 忽略 */
+      }
+    }
+  }, [updateConvMessages]);
 
   // 監聽 Pi RPC 真實事件
   useEffect(() => {
@@ -518,7 +562,7 @@ export const App: React.FC = () => {
       // 5. 任務完成或結算 (agent_settled)
       if (event.type === 'agent_settled' || event.type === 'agent_end') {
         setConvLoading(convId, false);
-        if (event.type === 'agent_settled') settlePendingSession(convId);
+        if (event.type === 'agent_settled') settlePendingSession(convId, true);
       }
     });
 
@@ -568,12 +612,14 @@ export const App: React.FC = () => {
         convId,
         message: text,
         cwd: currentProjectRef.current.path,
+        ssh: currentProjectRef.current.ssh,
         sessionFile: convFileByIdRef.current[convId] || (convId.startsWith('draft:') ? undefined : convId),
       });
       // 新對話：第一則訊息會讓 session 檔落地，稍後回來選取它
       if (convId.startsWith('draft:')) {
         setTimeout(() => settlePendingSession(convId), 500);
         setTimeout(() => settlePendingSession(convId), 1500);
+        setTimeout(() => settlePendingSession(convId), 3000);
       }
     } else {
       // 降級純前端提示
@@ -605,10 +651,17 @@ export const App: React.FC = () => {
     setRightPanelTab('subagents');
   }, []);
 
+  const handleOpenPathInRightPanel = useCallback((targetPath: string) => {
+    if (!targetPath) return;
+    setRightPanelTab('files');
+    setRevealFileRequest({ path: targetPath, nonce: Date.now() + Math.random() });
+  }, []);
+
   const handleSelectSession = async (session: Session, project?: Project) => {
     const filePath = session.filePath || session.id;
-    // 沿用既有 convId（若此對話是本次執行新開的），否則以檔名當 convId
-    const convId = convIdByFileRef.current[filePath] || filePath;
+    const ssh = session.ssh || project?.ssh;
+    // 沿用既有 convId（若此對話是本次執行新開的），否則以 session.id 當 convId
+    const convId = convIdByFileRef.current[filePath] || session.id || filePath;
     activeConvIdRef.current = convId;
     setActiveConvId(convId);
     setActiveSessionId(session.id);
@@ -619,7 +672,7 @@ export const App: React.FC = () => {
     }
     if (project) {
       setCurrentProject(project);
-      loadWorkspaceFiles(project.path);
+      loadWorkspaceFiles(project.path, project.ssh || null);
     }
 
     // 已有記憶體中的訊息（例如背景正在串流）→ 直接顯示，不要蓋掉最新內容
@@ -628,7 +681,10 @@ export const App: React.FC = () => {
     // 純讀檔載入歷史（不切換任何子程序的核心會話）
     if (ipcRenderer && session.filePath) {
       try {
-        const history: Message[] = await ipcRenderer.invoke('pi:load-session', session.filePath);
+        const history: Message[] = await ipcRenderer.invoke(
+          'pi:load-session',
+          ssh ? { filePath: session.filePath, ssh } : session.filePath
+        );
         updateConvMessages(convId, () =>
           Array.isArray(history) && history.length > 0
             ? history
@@ -666,10 +722,18 @@ export const App: React.FC = () => {
     setBashByConv(prev => ({ ...prev, [convId]: [] }));
     setLoadingByConv(prev => ({ ...prev, [convId]: false }));
     if (ipcRenderer) {
-      await ipcRenderer.invoke('pi:ensure-session', { convId, cwd: project.path });
+      await ipcRenderer.invoke('pi:ensure-session', {
+        convId,
+        cwd: project.path,
+        ssh: project.ssh,
+      });
     }
-    loadWorkspaceFiles(project.path);
-    showToast(`已在「${project.name}」開新對話`);
+    loadWorkspaceFiles(project.path, project.ssh || null);
+    showToast(
+      project.ssh
+        ? `已在遠端「${project.ssh.host}:${project.name}」開新對話`
+        : `已在「${project.name}」開新對話`
+    );
   };
 
   const handleOpenFolder = async () => {
@@ -683,9 +747,32 @@ export const App: React.FC = () => {
       sessions: [],
     };
     setProjects(prev =>
-      prev.some(p => normPath(p.path) === normPath(selected)) ? prev : [newProj, ...prev]
+      prev.some(p => !p.ssh && normPath(p.path) === normPath(selected)) ? prev : [newProj, ...prev]
     );
     await handleNewSessionInProject(newProj);
+  };
+
+  const handleSshProjectAdded = async (saved: { id: string; name: string; path: string; ssh: SshConfig }) => {
+    const list = await loadRealProjects();
+    const found = list.find(p => p.id === saved.id);
+    const targetProj: Project = found || {
+      id: saved.id,
+      name: saved.name,
+      path: saved.path,
+      ssh: saved.ssh,
+      sessions: [],
+    };
+    if (!found) {
+      setProjects(prev => [targetProj, ...prev]);
+    }
+    await handleNewSessionInProject(targetProj);
+  };
+
+  const handleRemoveSshProject = async (project: Project) => {
+    if (!ipcRenderer || !project.ssh) return;
+    await ipcRenderer.invoke('ssh:remove-project', project.id);
+    showToast(`已從列表移除遠端專案「${project.name}」`);
+    await loadRealProjects();
   };
 
   // ---- 對話管理（跨 session） -------------------------------------------
@@ -708,7 +795,11 @@ export const App: React.FC = () => {
     }
     const name = renameValue.trim();
     if (!name) return;
-    const res = await ipcRenderer.invoke('pi:rename-session', { filePath: renameTarget.filePath, name });
+    const res = await ipcRenderer.invoke('pi:rename-session', {
+      filePath: renameTarget.filePath,
+      name,
+      ssh: renameTarget.ssh,
+    });
     if (res?.success) {
       showToast('已重新命名');
       await loadRealProjects();
@@ -720,7 +811,10 @@ export const App: React.FC = () => {
 
   const handleDuplicateSession = async (session: Session) => {
     if (!session.filePath || !ipcRenderer) return;
-    const res = await ipcRenderer.invoke('pi:duplicate-session', session.filePath);
+    const res = await ipcRenderer.invoke(
+      'pi:duplicate-session',
+      session.ssh ? { filePath: session.filePath, ssh: session.ssh } : session.filePath
+    );
     if (res?.success) {
       showToast('已複製整個對話');
       await loadRealProjects();
@@ -732,14 +826,21 @@ export const App: React.FC = () => {
   const handleExportSession = async (session: Session, format: 'html' | 'jsonl') => {
     if (!session.filePath || !ipcRenderer) return;
     const ext = format === 'html' ? 'html' : 'jsonl';
-    const defaultPath = `${dirOf(session.filePath)}\\${safeName(session.title)}.${ext}`;
+    const defaultPath = session.ssh
+      ? `${safeName(session.title)}.${ext}`
+      : `${dirOf(session.filePath)}\\${safeName(session.title)}.${ext}`;
     const filters =
       format === 'html'
         ? [{ name: 'HTML 網頁', extensions: ['html'] }]
         : [{ name: 'JSONL 會話檔', extensions: ['jsonl'] }];
     const outputPath = await ipcRenderer.invoke('dialog:save-file', { defaultPath, filters });
     if (!outputPath) return;
-    const res = await ipcRenderer.invoke('pi:export-session', { filePath: session.filePath, format, outputPath });
+    const res = await ipcRenderer.invoke('pi:export-session', {
+      filePath: session.filePath,
+      format,
+      outputPath,
+      ssh: session.ssh,
+    });
     if (res?.success) showToast('已匯出：' + res.path);
     else showToast('匯出失敗：' + (res?.error || '未知錯誤'));
   };
@@ -756,7 +857,10 @@ export const App: React.FC = () => {
       setDeleteTarget(null);
       return;
     }
-    const res = await ipcRenderer.invoke('pi:delete-session', deleteTarget.filePath);
+    const res = await ipcRenderer.invoke(
+      'pi:delete-session',
+      deleteTarget.ssh ? { filePath: deleteTarget.filePath, ssh: deleteTarget.ssh } : deleteTarget.filePath
+    );
     if (res?.success) {
       showToast(res.trashed ? '已移至資源回收筒' : '已刪除對話');
       if (activeSessionId === deleteTarget.id) {
@@ -773,25 +877,200 @@ export const App: React.FC = () => {
 
   const expandAll = (action: 'expand' | 'collapse') => setExpandAllCmd({ action, nonce: Date.now() });
 
+  // ---- 單一使用者訊息粒度操作（對話框角落按鈕） --------------------------
+
+  const resolveActiveSessionTarget = useCallback(async () => {
+    const convId = activeConvIdRef.current;
+    if (!convId) return null;
+    const ssh = currentProjectRef.current.ssh;
+    let filePath = convFileByIdRef.current[convId];
+    if (!filePath && !convId.startsWith('draft:')) {
+      filePath = convId;
+    }
+    if (!filePath && ipcRenderer) {
+      try {
+        const info = await ipcRenderer.invoke('pi:ensure-session', {
+          convId,
+          cwd: currentProjectRef.current.path,
+          ssh,
+        });
+        if (info?.sessionFile) {
+          filePath = info.sessionFile;
+          convFileByIdRef.current[convId] = filePath;
+          convIdByFileRef.current[filePath] = convId;
+        }
+      } catch {
+        /* 忽略 */
+      }
+    }
+    if (!filePath) return null;
+    return { convId, filePath, ssh };
+  }, []);
+
+  const handleCopyMessage = useCallback(async (text: string) => {
+    if (ipcRenderer) {
+      await ipcRenderer.invoke('clipboard:write', text);
+    } else {
+      navigator.clipboard?.writeText(text).catch(() => {});
+    }
+    showToast('已複製訊息內容');
+  }, []);
+
+  const handleSwitchBranch = useCallback(async (_message: Message, targetLeafId: string) => {
+    if (!ipcRenderer) return;
+    const target = await resolveActiveSessionTarget();
+    if (!target) return;
+    const res = await ipcRenderer.invoke('pi:switch-branch', {
+      filePath: target.filePath,
+      targetLeafId,
+      ssh: target.ssh,
+      convId: target.convId,
+    });
+    if (res?.success && Array.isArray(res.messages)) {
+      updateConvMessages(target.convId, () => res.messages);
+      showToast('已切換平行對話分支');
+    } else {
+      showToast('切換分支失敗：' + (res?.error || '未知錯誤'));
+    }
+  }, [resolveActiveSessionTarget, updateConvMessages]);
+
+  const handleEditAndResend = useCallback(async (message: Message, newText: string, userTurnIndex: number) => {
+    if (!ipcRenderer) return;
+    const target = await resolveActiveSessionTarget();
+    if (!target) return;
+    const res = await ipcRenderer.invoke('pi:rewind-before-entry', {
+      filePath: target.filePath,
+      entryId: message.id,
+      userTurnIndex,
+      messageText: message.content,
+      ssh: target.ssh,
+      convId: target.convId,
+    });
+    if (!res?.success) {
+      showToast('建立編輯分支失敗：' + (res?.error || '未知錯誤'));
+      return;
+    }
+    if (Array.isArray(res.messages)) {
+      updateConvMessages(target.convId, () => res.messages);
+    }
+    handleSendMessage(newText);
+  }, [resolveActiveSessionTarget, updateConvMessages, handleSendMessage]);
+
+  const handleRegenerate = useCallback(async (message: Message, userTurnIndex: number) => {
+    if (!ipcRenderer) return;
+    const target = await resolveActiveSessionTarget();
+    if (!target) return;
+    const res = await ipcRenderer.invoke('pi:rewind-before-entry', {
+      filePath: target.filePath,
+      entryId: message.id,
+      userTurnIndex,
+      messageText: message.content,
+      ssh: target.ssh,
+      convId: target.convId,
+    });
+    if (!res?.success) {
+      showToast('重新生成失敗：' + (res?.error || '未知錯誤'));
+      return;
+    }
+    if (Array.isArray(res.messages)) {
+      updateConvMessages(target.convId, () => res.messages);
+    }
+    handleSendMessage(message.content);
+  }, [resolveActiveSessionTarget, updateConvMessages, handleSendMessage]);
+
+  const handleForkFromMessage = useCallback(async (message: Message, userTurnIndex: number) => {
+    if (!ipcRenderer) return;
+    const target = await resolveActiveSessionTarget();
+    if (!target) return;
+    const res = await ipcRenderer.invoke('pi:fork-session', {
+      filePath: target.filePath,
+      entryId: message.id,
+      userTurnIndex,
+      messageText: message.content,
+      ssh: target.ssh,
+    });
+    if (!res?.success || !res.newPath) {
+      showToast('分叉對話失敗：' + (res?.error || '未知錯誤'));
+      return;
+    }
+    const list = await loadRealProjects();
+    let forkedSession: Session | undefined;
+    let forkedProject: Project | undefined;
+    for (const p of list) {
+      const found = p.sessions.find(s => s.filePath === res.newPath);
+      if (found) {
+        forkedSession = found;
+        forkedProject = p;
+        break;
+      }
+    }
+    if (forkedSession) {
+      await handleSelectSession(forkedSession, forkedProject);
+    }
+    showToast('已從該處分叉出獨立的新對話');
+  }, [resolveActiveSessionTarget]);
+
+  const handleSetMessageLabel = useCallback(async (message: Message, label: string | undefined, userTurnIndex: number) => {
+    if (!ipcRenderer) return;
+    const target = await resolveActiveSessionTarget();
+    if (!target) return;
+    const res = await ipcRenderer.invoke('pi:set-entry-label', {
+      filePath: target.filePath,
+      entryId: message.id,
+      userTurnIndex,
+      messageText: message.content,
+      label,
+      ssh: target.ssh,
+      convId: target.convId,
+    });
+    if (res?.success && Array.isArray(res.messages)) {
+      updateConvMessages(target.convId, () => res.messages);
+      showToast(label ? `已標記書籤：${label}` : '已移除書籤');
+    } else {
+      showToast('設定書籤失敗：' + (res?.error || '未知錯誤'));
+    }
+  }, [resolveActiveSessionTarget, updateConvMessages]);
+
+  const handleToggleMessageOmit = useCallback(async (message: Message, userTurnIndex: number) => {
+    if (!ipcRenderer) return;
+    const target = await resolveActiveSessionTarget();
+    if (!target) return;
+    const res = await ipcRenderer.invoke('pi:toggle-context-omit', {
+      filePath: target.filePath,
+      entryId: message.id,
+      userTurnIndex,
+      messageText: message.content,
+      ssh: target.ssh,
+      convId: target.convId,
+    });
+    if (res?.success && Array.isArray(res.messages)) {
+      updateConvMessages(target.convId, () => res.messages);
+      showToast(res.omitted ? '已將此輪對話從 AI 上下文隱藏' : '已恢復此輪對話至 AI 上下文');
+    } else {
+      showToast('切換上下文狀態失敗：' + (res?.error || '未知錯誤'));
+    }
+  }, [resolveActiveSessionTarget, updateConvMessages]);
+
   // ---- 右鍵選單內容 --------------------------------------------------
 
   const openSessionMenu = (session: Session, project: Project, x: number, y: number) => {
+    const sWithSsh: Session = session.ssh ? session : { ...session, ssh: project.ssh };
     const items: ContextMenuItem[] = [
-      { label: '開啟', icon: <Play size={14} />, onClick: () => handleSelectSession(session, project) },
+      { label: '開啟', icon: <Play size={14} />, onClick: () => handleSelectSession(sWithSsh, project) },
       { separator: true },
-      { label: '重新命名…', icon: <Pencil size={14} />, onClick: () => handleRenameSession(session) },
-      { label: '複製整個對話', icon: <CopyPlus size={14} />, onClick: () => handleDuplicateSession(session) },
+      { label: '重新命名…', icon: <Pencil size={14} />, onClick: () => handleRenameSession(sWithSsh) },
+      { label: '複製整個對話', icon: <CopyPlus size={14} />, onClick: () => handleDuplicateSession(sWithSsh) },
       {
         label: '匯出',
         icon: <Download size={14} />,
         submenu: [
-          { label: '匯出 HTML…', icon: <FileCode size={14} />, onClick: () => handleExportSession(session, 'html') },
-          { label: '匯出 JSONL…', icon: <FileJson size={14} />, onClick: () => handleExportSession(session, 'jsonl') },
+          { label: '匯出 HTML…', icon: <FileCode size={14} />, onClick: () => handleExportSession(sWithSsh, 'html') },
+          { label: '匯出 JSONL…', icon: <FileJson size={14} />, onClick: () => handleExportSession(sWithSsh, 'jsonl') },
         ],
       },
-      { label: '複製路徑', icon: <ClipboardIcon size={14} />, onClick: () => handleCopyPath(session.filePath || session.id) },
+      { label: '複製路徑', icon: <ClipboardIcon size={14} />, onClick: () => handleCopyPath(sWithSsh.filePath || sWithSsh.id) },
       { separator: true },
-      { label: '刪除', icon: <Trash2 size={14} />, danger: true, onClick: () => handleDeleteSession(session) },
+      { label: '刪除', icon: <Trash2 size={14} />, danger: true, onClick: () => handleDeleteSession(sWithSsh) },
     ];
     setContextMenu({ x, y, items });
   };
@@ -799,17 +1078,47 @@ export const App: React.FC = () => {
   const openProjectMenu = (project: Project, x: number, y: number) => {
     const items: ContextMenuItem[] = [
       { label: '新對話', icon: <Plus size={14} />, onClick: () => handleNewSessionInProject(project) },
-      { label: '在檔案總管中開啟', icon: <FolderOpen size={14} />, onClick: () => ipcRenderer?.invoke('shell:open-path', project.path) },
-      { label: '複製路徑', icon: <ClipboardIcon size={14} />, onClick: () => handleCopyPath(project.path) },
+      ...(project.ssh
+        ? [
+            {
+              label: `複製 SSH 路徑 (${project.ssh.host}:${project.path})`,
+              icon: <ClipboardIcon size={14} />,
+              onClick: () => handleCopyPath(`${project.ssh!.host}:${project.path}`),
+            },
+          ]
+        : [
+            {
+              label: '在檔案總管中開啟',
+              icon: <FolderOpen size={14} />,
+              onClick: () => ipcRenderer?.invoke('shell:open-path', project.path),
+            },
+            {
+              label: '複製路徑',
+              icon: <ClipboardIcon size={14} />,
+              onClick: () => handleCopyPath(project.path),
+            },
+          ]),
       { separator: true },
       { label: '重新整理', icon: <RefreshCw size={14} />, onClick: () => { loadRealProjects(); showToast('已重新整理'); } },
+      ...(project.ssh
+        ? [
+            { separator: true },
+            {
+              label: '從列表移除此遠端專案',
+              icon: <Trash2 size={14} />,
+              danger: true,
+              onClick: () => handleRemoveSshProject(project),
+            },
+          ]
+        : []),
     ];
     setContextMenu({ x, y, items });
   };
 
   const openBlankMenu = (x: number, y: number) => {
     const items: ContextMenuItem[] = [
-      { label: '新增工作區…', icon: <FolderPlus size={14} />, onClick: handleOpenFolder },
+      { label: '新增本機工作區…', icon: <FolderPlus size={14} />, onClick: handleOpenFolder },
+      { label: '新增 SSH 遠端專案…', icon: <Server size={14} />, onClick: () => setIsSshModalOpen(true) },
       { separator: true },
       { label: '全部展開', icon: <ChevronsUpDown size={14} />, onClick: () => expandAll('expand') },
       { label: '全部收合', icon: <ChevronsUpDown size={14} />, onClick: () => expandAll('collapse') },
@@ -828,6 +1137,7 @@ export const App: React.FC = () => {
         onSelectSession={handleSelectSession}
         onNewSession={handleNewSession}
         onOpenFolder={handleOpenFolder}
+        onOpenSshModal={() => setIsSshModalOpen(true)}
         coreInfo={coreInfo}
         onOpenCoreManager={() => setIsCoreManagerOpen(true)}
         onOpenModelSettings={() => setIsModelSettingsOpen(true)}
@@ -853,12 +1163,20 @@ export const App: React.FC = () => {
         onSendMessage={handleSendMessage}
         onStop={handleStop}
         onInspectSubagent={handleInspectSubagent}
-        projectName={currentProject.name}
-        projectPath={currentProject.path}
+        projectName={currentProject.ssh ? `${currentProject.name} (${currentProject.ssh.host})` : currentProject.name}
+        projectPath={currentProject.ssh ? `${currentProject.ssh.host}:${currentProject.path}` : currentProject.path}
         conversationId={activeConvId}
         modelInfo={modelInfo}
         thinkingLevel={thinkingLevel}
         onOpenModelSettings={() => setIsModelSettingsOpen(true)}
+        onCopyMessage={handleCopyMessage}
+        onSwitchBranch={handleSwitchBranch}
+        onEditAndResend={handleEditAndResend}
+        onRegenerate={handleRegenerate}
+        onForkFromMessage={handleForkFromMessage}
+        onSetMessageLabel={handleSetMessageLabel}
+        onToggleMessageOmit={handleToggleMessageOmit}
+        onOpenPath={handleOpenPathInRightPanel}
       />
 
       {/* 可拖曳分隔線：中間對話區 ↔ 右側欄 */}
@@ -875,10 +1193,13 @@ export const App: React.FC = () => {
         onTabChange={setRightPanelTab}
         files={files}
         currentWorkspace={currentProject.path}
+        ssh={currentProject.ssh}
         subagents={allSubagents}
         selectedSubagentId={selectedSubagentId}
         onSelectSubagent={id => setSelectedSubagentId(id)}
+        refreshTrigger={fileRefreshTrigger}
         onRefreshFiles={() => loadWorkspaceFiles()}
+        revealRequest={revealFileRequest}
         width={rightPanelWidth}
       />
 
@@ -905,6 +1226,13 @@ export const App: React.FC = () => {
           setModelInfo(name);
           if (level) setThinkingLevel(level);
         }}
+      />
+
+      {/* 4c. SSH 遠端專案連線與目錄選擇器 Modal */}
+      <SshModal
+        isOpen={isSshModalOpen}
+        onClose={() => setIsSshModalOpen(false)}
+        onProjectAdded={handleSshProjectAdded}
       />
 
       {/* 5. 自製右鍵選單 */}

@@ -11,7 +11,7 @@ let terminalManager = null;
 function getTerminalManager() {
   if (!terminalManager) {
     const { TerminalManager } = require('./terminal-manager.cjs');
-    terminalManager = new TerminalManager(() => mainWindow);
+    terminalManager = new TerminalManager(() => mainWindow, () => piBridge?.sshManager);
   }
   return terminalManager;
 }
@@ -84,9 +84,9 @@ ipcMain.on('term:resize', (event, { id, cols, rows }) => getTerminalManager().re
 ipcMain.on('term:kill', (event, { id }) => getTerminalManager().kill(id));
 
 // 註冊 IPC 監聽
-ipcMain.on('pi:send-prompt', (event, { convId, message, id, cwd, sessionFile }) => {
+ipcMain.on('pi:send-prompt', (event, { convId, message, id, cwd, sessionFile, ssh }) => {
   if (piBridge) {
-    piBridge.prompt(convId, { message, id, cwd, sessionFile });
+    piBridge.prompt(convId, { message, id, cwd, sessionFile, ssh });
   }
 });
 
@@ -97,9 +97,9 @@ ipcMain.on('pi:abort', (event, { convId } = {}) => {
 });
 
 // 確保某個對話的子程序存在（需要時才開，閒置會被回收）
-ipcMain.handle('pi:ensure-session', (event, { convId, cwd, sessionFile }) => {
+ipcMain.handle('pi:ensure-session', (event, { convId, cwd, sessionFile, ssh }) => {
   if (!piBridge) return null;
-  return piBridge.ensureSessionReady(convId, { cwd, sessionFile });
+  return piBridge.ensureSessionReady(convId, { cwd, sessionFile, ssh });
 });
 
 // 告知目前畫面上開著的對話（正在檢視的閒置程序不回收）
@@ -112,33 +112,40 @@ ipcMain.on('pi:dispose-session', (event, { convId } = {}) => {
   if (piBridge) piBridge.disposeProcess(convId);
 });
 
-ipcMain.handle('pi:get-real-projects', () => {
+ipcMain.handle('pi:get-real-projects', async () => {
   if (piBridge) {
-    return piBridge.listRealSessions();
+    return await piBridge.listRealSessions();
   }
   return [];
 });
 
 // 載入指定 session 的歷史訊息（純讀檔，不再切換任何程序的核心會話）
-ipcMain.handle('pi:load-session', (event, filePath) => {
+ipcMain.handle('pi:load-session', async (event, arg) => {
   if (!piBridge) return [];
-  return piBridge.loadSession(filePath);
+  if (typeof arg === 'string') return await piBridge.loadSession(arg, null);
+  return await piBridge.loadSession(arg?.filePath, arg?.ssh || null);
 });
 
 // 重新命名對話
-ipcMain.handle('pi:rename-session', (event, { filePath, name }) => {
+ipcMain.handle('pi:rename-session', async (event, { filePath, name, ssh }) => {
   if (!piBridge) return { success: false, error: 'Bridge not ready' };
-  return piBridge.renameSession(filePath, name);
+  return await piBridge.renameSession(filePath, name, ssh || null);
 });
 
 // 複製整個對話
-ipcMain.handle('pi:duplicate-session', (event, filePath) => {
+ipcMain.handle('pi:duplicate-session', async (event, arg) => {
   if (!piBridge) return { success: false, error: 'Bridge not ready' };
-  return piBridge.duplicateSession(filePath);
+  if (typeof arg === 'string') return await piBridge.duplicateSession(arg, null);
+  return await piBridge.duplicateSession(arg?.filePath, arg?.ssh || null);
 });
 
-// 刪除對話：優先丟資源回收筒（trash），失敗才直接刪除
-ipcMain.handle('pi:delete-session', async (event, filePath) => {
+// 刪除對話：優先丟資源回收筒（trash），失敗才直接刪除（遠端對話透過 SSH 刪除）
+ipcMain.handle('pi:delete-session', async (event, arg) => {
+  const filePath = typeof arg === 'string' ? arg : arg?.filePath;
+  const ssh = typeof arg === 'object' ? arg?.ssh : null;
+  if (ssh && piBridge) {
+    return await piBridge.sshManager.deleteRemoteSession(ssh, filePath);
+  }
   try {
     await shell.trashItem(filePath);
     return { success: true, trashed: true };
@@ -153,10 +160,81 @@ ipcMain.handle('pi:delete-session', async (event, filePath) => {
 });
 
 // 匯出對話（html / jsonl）
-ipcMain.handle('pi:export-session', (event, { filePath, format, outputPath }) => {
+ipcMain.handle('pi:export-session', async (event, { filePath, format, outputPath, ssh }) => {
   if (!piBridge) return { success: false, error: 'Bridge not ready' };
-  if (format === 'jsonl') return piBridge.copySessionFile(filePath, outputPath);
-  return piBridge.exportSessionHtml(filePath, outputPath);
+  if (format === 'jsonl') return await piBridge.copySessionFile(filePath, outputPath, ssh || null);
+  return await piBridge.exportSessionHtml(filePath, outputPath, ssh || null);
+});
+
+// 單一訊息粒度操作：切換同層分支版本 (< 1/N >)
+ipcMain.handle('pi:switch-branch', async (event, { filePath, targetLeafId, ssh, convId }) => {
+  if (!piBridge) return { success: false, error: 'Bridge not ready' };
+  return await piBridge.switchBranch(filePath, targetLeafId, ssh || null, convId || null);
+});
+
+// 單一訊息粒度操作：回溯至指定使用者訊息之前（供編輯重送 / 重新生成使用）
+ipcMain.handle('pi:rewind-before-entry', async (event, { filePath, entryId, userTurnIndex, messageText, ssh, convId }) => {
+  if (!piBridge) return { success: false, error: 'Bridge not ready' };
+  return await piBridge.rewindBeforeEntry(
+    filePath,
+    { entryId, userTurnIndex, messageText },
+    ssh || null,
+    convId || null
+  );
+});
+
+// 單一訊息粒度操作：從指定使用者訊息處分支出新對話檔 (Fork)
+ipcMain.handle('pi:fork-session', async (event, { filePath, entryId, userTurnIndex, messageText, ssh }) => {
+  if (!piBridge) return { success: false, error: 'Bridge not ready' };
+  return await piBridge.forkFromEntry(filePath, { entryId, userTurnIndex, messageText }, ssh || null);
+});
+
+// 單一訊息粒度操作：設定或移除書籤標籤 (LabelEntry)
+ipcMain.handle('pi:set-entry-label', async (event, { filePath, entryId, userTurnIndex, messageText, label, ssh, convId }) => {
+  if (!piBridge) return { success: false, error: 'Bridge not ready' };
+  return await piBridge.setEntryLabel(
+    filePath,
+    { entryId, userTurnIndex, messageText, label },
+    ssh || null,
+    convId || null
+  );
+});
+
+// 單一訊息粒度操作：切換是否從 AI 上下文略過此回合 (ContextEditEntry)
+ipcMain.handle('pi:toggle-context-omit', async (event, { filePath, entryId, userTurnIndex, messageText, omit, ssh, convId }) => {
+  if (!piBridge) return { success: false, error: 'Bridge not ready' };
+  return await piBridge.toggleContextOmit(
+    filePath,
+    { entryId, userTurnIndex, messageText, omit },
+    ssh || null,
+    convId || null
+  );
+});
+
+// SSH 遠端專案與目錄瀏覽 IPC Handlers
+ipcMain.handle('ssh:browse-dir', async (event, { ssh, targetPath }) => {
+  if (!piBridge) return { success: false, error: 'Bridge not ready' };
+  return await piBridge.sshManager.browseRemoteDir(ssh, targetPath);
+});
+
+ipcMain.handle('ssh:mkdir', async (event, { ssh, dirPath }) => {
+  if (!piBridge) return { success: false, error: 'Bridge not ready' };
+  return await piBridge.sshManager.mkdirRemote(ssh, dirPath);
+});
+
+ipcMain.handle('ssh:save-project', async (event, { ssh, remotePath, name }) => {
+  if (!piBridge) return null;
+  return piBridge.sshManager.saveRemoteProject({ ssh, remotePath, name });
+});
+
+ipcMain.handle('ssh:remove-project', async (event, projectId) => {
+  if (!piBridge) return { success: false };
+  return piBridge.sshManager.removeRemoteProject(projectId);
+});
+
+ipcMain.handle('ssh:get-saved-hosts', async () => {
+  if (!piBridge) return [];
+  return piBridge.sshManager.getSavedHosts();
 });
 
 // 另存新檔對話框
@@ -194,30 +272,368 @@ ipcMain.handle('dialog:openDirectory', async () => {
   return result.filePaths[0] || null;
 });
 
-// 真實讀取 Workspace 檔案樹
-ipcMain.handle('fs:read-directory', async (event, dirPath) => {
-  const targetDir = dirPath || process.cwd();
-  function scan(currentPath, depth = 0) {
-    if (depth > 2) return []; // 限制深度以免太大
-    try {
-      const items = fs.readdirSync(currentPath);
-      return items
-        .filter(item => !item.startsWith('.') && item !== 'node_modules' && item !== 'dist' && item !== 'reference')
-        .map(item => {
-          const full = path.join(currentPath, item);
-          const isDir = fs.statSync(full).isDirectory();
-          return {
-            name: item,
-            path: path.relative(targetDir, full),
-            isDirectory: isDir,
-            children: isDir ? scan(full, depth + 1) : undefined,
-          };
-        });
-    } catch (e) {
-      return [];
-    }
+// 真實讀取目錄內容（支援本機與 SSH 遠端、包含隱藏檔、單層即時導覽與上一層路徑）
+ipcMain.handle('fs:read-directory', async (event, arg) => {
+  const dirPath = typeof arg === 'string' ? arg : arg?.dirPath;
+  const ssh = typeof arg === 'object' ? arg?.ssh : null;
+  if (ssh && piBridge) {
+    return await piBridge.sshManager.readRemoteWorkspaceTree(ssh, dirPath);
   }
-  return scan(targetDir);
+
+  let currentPath = path.resolve(dirPath || process.cwd());
+  try {
+    if (!fs.existsSync(currentPath)) {
+      const parentPath = path.dirname(currentPath) !== currentPath ? path.dirname(currentPath) : null;
+      return {
+        success: false,
+        error: `目錄不存在: ${currentPath}`,
+        currentPath,
+        parentPath,
+        items: [],
+      };
+    }
+
+    const st = fs.statSync(currentPath);
+    if (!st.isDirectory()) {
+      currentPath = path.dirname(currentPath);
+    }
+
+    const parentPath = path.dirname(currentPath) !== currentPath ? path.dirname(currentPath) : null;
+    const entries = fs.readdirSync(currentPath, { withFileTypes: true });
+    const items = [];
+
+    for (const entry of entries) {
+      const name = entry.name;
+      const full = path.join(currentPath, name);
+      let isDir = entry.isDirectory();
+      let size = undefined;
+      let mtimeMs = undefined;
+      try {
+        if (entry.isSymbolicLink()) {
+          const itemStat = fs.statSync(full);
+          isDir = itemStat.isDirectory();
+          size = isDir ? undefined : itemStat.size;
+          mtimeMs = itemStat.mtimeMs;
+        } else if (!isDir) {
+          const itemStat = fs.statSync(full);
+          size = itemStat.size;
+          mtimeMs = itemStat.mtimeMs;
+        }
+      } catch {}
+
+      items.push({
+        name,
+        path: full,
+        isDirectory: isDir,
+        size,
+        mtimeMs,
+        isHidden: name.startsWith('.'),
+      });
+    }
+
+    items.sort((a, b) => {
+      if (a.isDirectory !== b.isDirectory) return a.isDirectory ? -1 : 1;
+      return a.name.localeCompare(b.name, undefined, { numeric: true, sensitivity: 'base' });
+    });
+
+    return {
+      success: true,
+      currentPath,
+      parentPath,
+      items,
+    };
+  } catch (e) {
+    return {
+      success: false,
+      error: e.message || String(e),
+      currentPath,
+      parentPath: path.dirname(currentPath) !== currentPath ? path.dirname(currentPath) : null,
+      items: [],
+    };
+  }
+});
+
+// 讀取單一檔案內容（支援本機與 SSH 遠端、文字、圖片 Base64、SVG 雙模態、二進位偵測）
+ipcMain.handle('fs:read-file', async (event, arg) => {
+  const filePath = typeof arg === 'string' ? arg : arg?.filePath;
+  const ssh = typeof arg === 'object' ? arg?.ssh : null;
+  if (ssh && piBridge) {
+    return await piBridge.sshManager.readRemoteFile(ssh, filePath);
+  }
+
+  try {
+    const resolved = path.resolve(String(filePath));
+    if (!fs.existsSync(resolved)) {
+      return { success: false, error: `找不到檔案: ${resolved}` };
+    }
+    const st = fs.statSync(resolved);
+    if (st.isDirectory()) {
+      return { success: false, error: '目標路徑是資料夾而非檔案' };
+    }
+
+    const name = path.basename(resolved);
+    const ext = path.extname(name).toLowerCase();
+    const IMAGE_MIMES = {
+      '.png': 'image/png',
+      '.jpg': 'image/jpeg',
+      '.jpeg': 'image/jpeg',
+      '.gif': 'image/gif',
+      '.webp': 'image/webp',
+      '.svg': 'image/svg+xml',
+      '.ico': 'image/x-icon',
+      '.bmp': 'image/bmp',
+      '.avif': 'image/avif',
+    };
+
+    const MAX_TEXT_BYTES = 2 * 1024 * 1024; // 2MB
+    const MAX_IMAGE_BYTES = 15 * 1024 * 1024; // 15MB
+
+    if (IMAGE_MIMES[ext]) {
+      if (st.size > MAX_IMAGE_BYTES) {
+        return {
+          success: true,
+          filePath: resolved,
+          name,
+          kind: 'binary',
+          size: st.size,
+        };
+      }
+      const buf = fs.readFileSync(resolved);
+      const mime = IMAGE_MIMES[ext];
+      const dataUrl = `data:${mime};base64,${buf.toString('base64')}`;
+      const content = ext === '.svg' && st.size <= MAX_TEXT_BYTES ? buf.toString('utf-8') : undefined;
+      return {
+        success: true,
+        filePath: resolved,
+        name,
+        kind: 'image',
+        dataUrl,
+        content,
+        size: st.size,
+      };
+    }
+
+    const readLen = Math.min(st.size, MAX_TEXT_BYTES);
+    const fd = fs.openSync(resolved, 'r');
+    const buf = Buffer.alloc(readLen);
+    try {
+      fs.readSync(fd, buf, 0, readLen, 0);
+    } finally {
+      fs.closeSync(fd);
+    }
+
+    // 檢查前 8KB 是否含有 null byte (0x00)
+    const checkLen = Math.min(readLen, 8192);
+    for (let i = 0; i < checkLen; i++) {
+      if (buf[i] === 0) {
+        return {
+          success: true,
+          filePath: resolved,
+          name,
+          kind: 'binary',
+          size: st.size,
+        };
+      }
+    }
+
+    return {
+      success: true,
+      filePath: resolved,
+      name,
+      kind: 'text',
+      content: buf.toString('utf-8'),
+      size: st.size,
+      truncated: st.size > MAX_TEXT_BYTES,
+    };
+  } catch (e) {
+    return { success: false, error: e.message || String(e) };
+  }
+});
+
+// 寫入單一檔案內容（支援本機與 SSH 遠端）
+ipcMain.handle('fs:write-file', async (event, arg) => {
+  const { filePath, content, ssh } = arg || {};
+  if (!filePath) return { success: false, error: '缺少檔案路徑' };
+  if (ssh && piBridge) {
+    return await piBridge.sshManager.writeRemoteFile(ssh, filePath, content);
+  }
+  try {
+    const resolved = path.resolve(String(filePath));
+    fs.writeFileSync(resolved, String(content ?? ''), 'utf-8');
+    const st = fs.statSync(resolved);
+    return { success: true, size: st.size };
+  } catch (e) {
+    return { success: false, error: e.message || String(e) };
+  }
+});
+
+// 建立新檔案或新資料夾（支援本機與 SSH 遠端）
+ipcMain.handle('fs:create-item', async (event, arg) => {
+  const { parentDir, name, isDirectory, ssh } = arg || {};
+  if (ssh && piBridge) {
+    return await piBridge.sshManager.createRemoteItem(ssh, { parentDir, name, isDirectory });
+  }
+  try {
+    const cleanName = String(name || '').trim();
+    if (!cleanName || cleanName.includes('/') || cleanName.includes('\\')) {
+      return { success: false, error: '無效的名稱' };
+    }
+    const targetPath = path.join(path.resolve(String(parentDir)), cleanName);
+    if (fs.existsSync(targetPath)) {
+      return { success: false, error: `已存在同名檔案或資料夾: ${cleanName}` };
+    }
+    if (isDirectory) {
+      fs.mkdirSync(targetPath, { recursive: true });
+    } else {
+      fs.writeFileSync(targetPath, '', 'utf-8');
+    }
+    return { success: true, path: targetPath };
+  } catch (e) {
+    return { success: false, error: e.message || String(e) };
+  }
+});
+
+// 重新命名檔案或資料夾（支援本機與 SSH 遠端）
+ipcMain.handle('fs:rename-item', async (event, arg) => {
+  const { oldPath, newName, ssh } = arg || {};
+  if (ssh && piBridge) {
+    return await piBridge.sshManager.renameRemoteItem(ssh, { oldPath, newName });
+  }
+  try {
+    const cleanName = String(newName || '').trim();
+    if (!cleanName || cleanName.includes('/') || cleanName.includes('\\')) {
+      return { success: false, error: '無效的名稱' };
+    }
+    const resolvedOld = path.resolve(String(oldPath));
+    const newPath = path.join(path.dirname(resolvedOld), cleanName);
+    if (resolvedOld === newPath) {
+      return { success: true, path: newPath };
+    }
+    if (resolvedOld.toLowerCase() !== newPath.toLowerCase() && fs.existsSync(newPath)) {
+      return { success: false, error: `目標名稱已存在: ${cleanName}` };
+    }
+    fs.renameSync(resolvedOld, newPath);
+    return { success: true, path: newPath };
+  } catch (e) {
+    return { success: false, error: e.message || String(e) };
+  }
+});
+
+// 拖曳移動一個或多個檔案/資料夾（支援本機與 SSH 遠端）
+ipcMain.handle('fs:move-items', async (event, arg) => {
+  const { sourcePaths, targetDir, ssh } = arg || {};
+  if (ssh && piBridge) {
+    return await piBridge.sshManager.moveRemoteItems(ssh, { sourcePaths, targetDir });
+  }
+  try {
+    const resolvedTargetDir = path.resolve(String(targetDir));
+    if (!fs.existsSync(resolvedTargetDir) || !fs.statSync(resolvedTargetDir).isDirectory()) {
+      return { success: false, error: '目標資料夾不存在' };
+    }
+    for (const src of sourcePaths || []) {
+      const resolvedSrc = path.resolve(String(src));
+      if (!fs.existsSync(resolvedSrc)) continue;
+      if (
+        resolvedTargetDir.toLowerCase() === resolvedSrc.toLowerCase() ||
+        resolvedTargetDir.toLowerCase().startsWith(resolvedSrc.toLowerCase() + path.sep)
+      ) {
+        return { success: false, error: '無法將資料夾移入自身或其子目錄' };
+      }
+      const baseName = path.basename(resolvedSrc);
+      const destPath = path.join(resolvedTargetDir, baseName);
+      if (resolvedSrc.toLowerCase() === destPath.toLowerCase()) continue;
+      if (fs.existsSync(destPath)) {
+        return { success: false, error: `目標資料夾已存在同名項目: ${baseName}` };
+      }
+      try {
+        fs.renameSync(resolvedSrc, destPath);
+      } catch {
+        fs.cpSync(resolvedSrc, destPath, { recursive: true });
+        fs.rmSync(resolvedSrc, { recursive: true, force: true });
+      }
+    }
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: e.message || String(e) };
+  }
+});
+
+// 貼上（複製或剪下）一個或多個檔案/資料夾，自動處理同名副本（支援本機與 SSH 遠端）
+ipcMain.handle('fs:paste-items', async (event, arg) => {
+  const { sourcePaths, targetDir, mode, ssh } = arg || {};
+  if (ssh && piBridge) {
+    return await piBridge.sshManager.pasteRemoteItems(ssh, { sourcePaths, targetDir, mode });
+  }
+  try {
+    const resolvedTargetDir = path.resolve(String(targetDir));
+    if (!fs.existsSync(resolvedTargetDir) || !fs.statSync(resolvedTargetDir).isDirectory()) {
+      return { success: false, error: '目標資料夾不存在' };
+    }
+
+    function getUniqueDestPath(dir, name, isDir) {
+      const candidate = path.join(dir, name);
+      if (!fs.existsSync(candidate)) return candidate;
+      const ext = isDir ? '' : path.extname(name);
+      const base = isDir ? name : name.slice(0, name.length - ext.length);
+      let idx = 1;
+      while (true) {
+        const suffix = idx === 1 ? ' copy' : ` copy ${idx}`;
+        const nextPath = path.join(dir, `${base}${suffix}${ext}`);
+        if (!fs.existsSync(nextPath)) return nextPath;
+        idx++;
+      }
+    }
+
+    for (const src of sourcePaths || []) {
+      const resolvedSrc = path.resolve(String(src));
+      if (!fs.existsSync(resolvedSrc)) continue;
+      if (resolvedTargetDir.toLowerCase().startsWith(resolvedSrc.toLowerCase() + path.sep)) {
+        return { success: false, error: '無法將資料夾複製或移入其子目錄內' };
+      }
+      const st = fs.statSync(resolvedSrc);
+      const isDir = st.isDirectory();
+      const baseName = path.basename(resolvedSrc);
+      if (mode === 'cut') {
+        if (path.dirname(resolvedSrc).toLowerCase() === resolvedTargetDir.toLowerCase()) continue;
+        const destPath = getUniqueDestPath(resolvedTargetDir, baseName, isDir);
+        try {
+          fs.renameSync(resolvedSrc, destPath);
+        } catch {
+          fs.cpSync(resolvedSrc, destPath, { recursive: true });
+          fs.rmSync(resolvedSrc, { recursive: true, force: true });
+        }
+      } else {
+        const destPath = getUniqueDestPath(resolvedTargetDir, baseName, isDir);
+        fs.cpSync(resolvedSrc, destPath, { recursive: true });
+      }
+    }
+    return { success: true };
+  } catch (e) {
+    return { success: false, error: e.message || String(e) };
+  }
+});
+
+// 刪除一個或多個檔案/資料夾（本機優先移至資源回收筒，SSH 遠端直接刪除）
+ipcMain.handle('fs:delete-items', async (event, arg) => {
+  const { paths, ssh } = arg || {};
+  if (ssh && piBridge) {
+    return await piBridge.sshManager.deleteRemoteItems(ssh, { paths });
+  }
+  try {
+    let allTrashed = true;
+    for (const p of paths || []) {
+      const resolved = path.resolve(String(p));
+      try {
+        await shell.trashItem(resolved);
+      } catch {
+        allTrashed = false;
+        fs.rmSync(resolved, { recursive: true, force: true });
+      }
+    }
+    return { success: true, trashed: allTrashed };
+  } catch (e) {
+    return { success: false, error: e.message || String(e) };
+  }
 });
 
 // 核心動態更新管理 IPC Handlers

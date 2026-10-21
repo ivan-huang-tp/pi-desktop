@@ -2,6 +2,7 @@
 const fs = require('fs');
 const os = require('os');
 const path = require('path');
+const { quotePosix } = require('./ssh-manager.cjs');
 
 let pty = null;
 let ptyLoadError = null;
@@ -95,8 +96,9 @@ function detectShells() {
 }
 
 class TerminalManager {
-  constructor(getWindow) {
+  constructor(getWindow, getSshManager) {
     this.getWindow = getWindow;
+    this.getSshManager = getSshManager;
     this.terms = new Map(); // id -> pty
     this.seq = 0;
     this.shells = null;
@@ -117,9 +119,58 @@ class TerminalManager {
     };
   }
 
-  create({ shellId, cwd, cols, rows } = {}) {
+  create({ shellId, cwd, cols, rows, ssh } = {}) {
     const ptyLib = ensurePty();
     if (!ptyLib) return { success: false, error: `node-pty 無法載入：${ptyLoadError?.message || 'unknown'}` };
+
+    // 若為 SSH 遠端專案且未強制指定本機 shellId，直接開啟遠端 SSH 互動式終端機
+    if (ssh && ssh.host && !shellId) {
+      try {
+        const sshMgr = this.getSshManager ? this.getSshManager() : null;
+        const normSsh = sshMgr ? sshMgr.normalizeSshConfig(ssh) : ssh;
+        const sshExe = process.platform === 'win32' ? (which('ssh.exe') || 'ssh.exe') : 'ssh';
+        const remoteDir = cwd || '~';
+        const remoteCmd = remoteDir === '~'
+          ? 'exec ${SHELL:-/bin/bash} -l'
+          : `cd ${quotePosix(remoteDir)} 2>/dev/null || true; exec \${SHELL:-/bin/bash} -l`;
+
+        const sshArgs = [
+          '-t',
+          '-o', 'StrictHostKeyChecking=accept-new',
+          '-o', 'ServerAliveInterval=15',
+          '-o', 'ServerAliveCountMax=3',
+        ];
+        if (normSsh.port && normSsh.port !== 22) {
+          sshArgs.push('-p', String(normSsh.port));
+        }
+        sshArgs.push(...String(normSsh.host).split(/\s+/).filter(Boolean), remoteCmd);
+
+        const env = sshMgr
+          ? sshMgr.buildSshEnv(normSsh)
+          : { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' };
+
+        const proc = ptyLib.spawn(sshExe, sshArgs, {
+          name: 'xterm-256color',
+          cols: Math.max(2, cols || 80),
+          rows: Math.max(2, rows || 24),
+          cwd: os.homedir(),
+          env,
+          useConpty: true,
+        });
+        const id = `term-${++this.seq}`;
+        this.terms.set(id, proc);
+        proc.onData((data) => this.send('term:data', { id, data }));
+        proc.onExit(({ exitCode }) => {
+          this.terms.delete(id);
+          this.send('term:exit', { id, exitCode });
+        });
+        const shellName = `SSH: ${normSsh.host}`;
+        return { success: true, id, shellId: 'ssh', shellName, cwd: remoteDir };
+      } catch (e) {
+        return { success: false, error: e.message };
+      }
+    }
+
     if (!this.shells) this.shells = detectShells();
     const shell = this.shells.find((s) => s.id === shellId) || this.shells[0];
     const workDir = exists(cwd) ? cwd : os.homedir();

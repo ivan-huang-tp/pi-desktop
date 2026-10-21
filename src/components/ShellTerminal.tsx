@@ -1,7 +1,8 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { Terminal as XTerm } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
-import { Plus, X, ChevronDown, Trash2, Terminal as TerminalIcon } from 'lucide-react';
+import { Plus, X, ChevronDown, Trash2, Terminal as TerminalIcon, Server } from 'lucide-react';
+import type { SshConfig } from '../types';
 
 // 取得 Electron IPC（在 Electron 環境中可用）
 const electron = (window as any).require ? (window as any).require('electron') : null;
@@ -16,6 +17,8 @@ interface TabInfo {
   key: number;
   shellId?: string;
   title: string;
+  cwd: string;
+  ssh?: SshConfig;
 }
 
 /* ------------------------------------------------------------------ */
@@ -70,6 +73,7 @@ const XTERM_THEME = {
 interface TerminalInstanceProps {
   shellId?: string;
   cwd: string;
+  ssh?: SshConfig;
   visible: boolean;
   clearSignal: number;
   onReady: (shellName: string) => void;
@@ -79,6 +83,7 @@ interface TerminalInstanceProps {
 const TerminalInstance: React.FC<TerminalInstanceProps> = ({
   shellId,
   cwd,
+  ssh,
   visible,
   clearSignal,
   onReady,
@@ -158,7 +163,7 @@ const TerminalInstance: React.FC<TerminalInstanceProps> = ({
       term.writeln('\x1b[33m此功能需要在 Electron 桌面版中執行。\x1b[0m');
     } else {
       ipcRenderer
-        .invoke('term:create', { shellId, cwd, cols: term.cols, rows: term.rows })
+        .invoke('term:create', { shellId, cwd, cols: term.cols, rows: term.rows, ssh })
         .then((res: any) => {
           if (!res?.success) {
             term.writeln(`\x1b[31m無法啟動終端機：${res?.error || '未知錯誤'}\x1b[0m`);
@@ -239,17 +244,41 @@ const TerminalInstance: React.FC<TerminalInstanceProps> = ({
 /* ------------------------------------------------------------------ */
 interface ShellTerminalProps {
   cwd: string;
+  ssh?: SshConfig;
 }
 
-export const ShellTerminal: React.FC<ShellTerminalProps> = ({ cwd }) => {
+export const ShellTerminal: React.FC<ShellTerminalProps> = ({ cwd, ssh }) => {
   const nextKey = useRef(2);
-  const [tabs, setTabs] = useState<TabInfo[]>([{ key: 1, title: '終端機' }]);
+  const [tabs, setTabs] = useState<TabInfo[]>([
+    { key: 1, title: ssh ? `SSH: ${ssh.host}` : '終端機', cwd, ssh },
+  ]);
   const [activeKey, setActiveKey] = useState(1);
   const [shells, setShells] = useState<ShellInfo[]>([]);
   const [menuOpen, setMenuOpen] = useState(false);
   const [clearSignal, setClearSignal] = useState(0);
   const menuRef = useRef<HTMLDivElement>(null);
   const tabStripRef = useRef<HTMLDivElement>(null);
+  const lastEnvRef = useRef<string>(`${ssh?.id || 'local'}::${cwd}`);
+
+  // 當切換到不同的 SSH 遠端專案時，自動切換至該遠端終端機分頁（若尚無則自動新開一個）
+  useEffect(() => {
+    const envId = `${ssh?.id || 'local'}::${cwd}`;
+    if (envId === lastEnvRef.current) return;
+    lastEnvRef.current = envId;
+
+    if (ssh) {
+      setTabs((prev) => {
+        const existing = prev.find((t) => t.ssh?.id === ssh.id && t.cwd === cwd);
+        if (existing) {
+          setActiveKey(existing.key);
+          return prev;
+        }
+        const key = nextKey.current++;
+        setActiveKey(key);
+        return [...prev, { key, title: `SSH: ${ssh.host}`, cwd, ssh }];
+      });
+    }
+  }, [cwd, ssh]);
 
   // 切換／新增分頁時，自動捲到看得見該分頁
   useEffect(() => {
@@ -274,10 +303,16 @@ export const ShellTerminal: React.FC<ShellTerminalProps> = ({ cwd }) => {
     return () => window.removeEventListener('mousedown', onDown);
   }, [menuOpen]);
 
-  const addTab = (shellId?: string) => {
+  const addTab = (shellId?: string, forceLocal = false) => {
     const key = nextKey.current++;
-    const shellName = shells.find((s) => s.id === shellId)?.name;
-    setTabs((prev) => [...prev, { key, shellId, title: shellName || '終端機' }]);
+    const useSsh = !forceLocal && !shellId ? ssh : undefined;
+    const shellName = useSsh
+      ? `SSH: ${useSsh.host}`
+      : shells.find((s) => s.id === shellId)?.name;
+    setTabs((prev) => [
+      ...prev,
+      { key, shellId, title: shellName || '終端機', cwd, ssh: useSsh },
+    ]);
     setActiveKey(key);
     setMenuOpen(false);
   };
@@ -323,7 +358,11 @@ export const ShellTerminal: React.FC<ShellTerminalProps> = ({ cwd }) => {
                   : 'hover:bg-zinc-800/40 hover:text-zinc-300'
               }`}
             >
-              <TerminalIcon size={12} className="text-emerald-400 shrink-0" />
+              {t.ssh ? (
+                <Server size={12} className="text-cyan-400 shrink-0" />
+              ) : (
+                <TerminalIcon size={12} className="text-emerald-400 shrink-0" />
+              )}
               <span className="flex-1 min-w-0 truncate">{t.title}</span>
               <button
                 onClick={(e) => {
@@ -358,14 +397,26 @@ export const ShellTerminal: React.FC<ShellTerminalProps> = ({ cwd }) => {
             <ChevronDown size={12} />
           </button>
           {menuOpen && (
-            <div className="absolute right-0 top-full mt-1 z-20 min-w-[170px] rounded-md border border-[#2f2f35] bg-[#1c1c20] py-1 shadow-xl">
+            <div className="absolute right-0 top-full mt-1 z-20 min-w-[190px] rounded-md border border-[#2f2f35] bg-[#1c1c20] py-1 shadow-xl">
+              {ssh && (
+                <>
+                  <button
+                    onClick={() => addTab(undefined, false)}
+                    className="w-full text-left px-3 py-1.5 text-cyan-300 hover:bg-zinc-700/60 hover:text-cyan-100 flex items-center gap-1.5 font-mono text-xs"
+                  >
+                    <Server size={12} className="text-cyan-400 shrink-0" />
+                    <span className="truncate">SSH: {ssh.host}</span>
+                  </button>
+                  <div className="my-1 border-t border-[#2f2f35]" />
+                </>
+              )}
               {shells.length === 0 && (
-                <div className="px-3 py-1.5 text-zinc-500">找不到可用的 Shell</div>
+                <div className="px-3 py-1.5 text-zinc-500">找不到可用的本機 Shell</div>
               )}
               {shells.map((s) => (
                 <button
                   key={s.id}
-                  onClick={() => addTab(s.id)}
+                  onClick={() => addTab(s.id, true)}
                   className="w-full text-left px-3 py-1.5 text-zinc-300 hover:bg-zinc-700/60 hover:text-zinc-100"
                 >
                   {s.name}
@@ -390,7 +441,8 @@ export const ShellTerminal: React.FC<ShellTerminalProps> = ({ cwd }) => {
           <TerminalInstance
             key={t.key}
             shellId={t.shellId}
-            cwd={cwd}
+            cwd={t.cwd}
+            ssh={t.ssh}
             visible={t.key === activeKey}
             clearSignal={clearSignal}
             onReady={(name) => setTitle(t.key, name)}
