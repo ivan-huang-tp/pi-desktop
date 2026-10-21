@@ -4,6 +4,7 @@ import { ChatArea } from './components/ChatArea';
 import { RightPanel, RightPanelTab } from './components/RightPanel';
 import { CoreManagerModal } from './components/CoreManagerModal';
 import { ModelSettingsModal } from './components/ModelSettingsModal';
+import { SettingsModal } from './components/SettingsModal';
 import { SshModal } from './components/SshModal';
 import { ContextMenu, ContextMenuItem } from './components/ContextMenu';
 import { ResizeHandle } from './components/ResizeHandle';
@@ -167,6 +168,7 @@ export const App: React.FC = () => {
   const [isCoreManagerOpen, setIsCoreManagerOpen] = useState(false);
   const [isModelSettingsOpen, setIsModelSettingsOpen] = useState(false);
   const [isSshModalOpen, setIsSshModalOpen] = useState(false);
+  const [isAppSettingsOpen, setIsAppSettingsOpen] = useState(false);
 
   // 6. 右鍵選單 / 對話管理彈窗 / 提示
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; items: ContextMenuItem[] } | null>(null);
@@ -1141,6 +1143,7 @@ export const App: React.FC = () => {
         coreInfo={coreInfo}
         onOpenCoreManager={() => setIsCoreManagerOpen(true)}
         onOpenModelSettings={() => setIsModelSettingsOpen(true)}
+        onOpenAppSettings={() => setIsAppSettingsOpen(true)}
         onSessionContextMenu={openSessionMenu}
         onProjectContextMenu={openProjectMenu}
         onBlankContextMenu={openBlankMenu}
@@ -1233,6 +1236,12 @@ export const App: React.FC = () => {
         isOpen={isSshModalOpen}
         onClose={() => setIsSshModalOpen(false)}
         onProjectAdded={handleSshProjectAdded}
+      />
+
+      {/* 4d. 程式設定（Trace 記錄、遠端終端機） */}
+      <SettingsModal
+        isOpen={isAppSettingsOpen}
+        onClose={() => setIsAppSettingsOpen(false)}
       />
 
       {/* 5. 自製右鍵選單 */}

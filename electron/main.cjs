@@ -4,14 +4,19 @@ const fs = require('fs');
 const os = require('os');
 const { PiBridge } = require('./pi-bridge.cjs');
 const { TerminalManager } = require('./terminal-manager.cjs');
+const { setTracer } = require('./ssh-manager.cjs');
+const { AppSettings } = require('./app-settings.cjs');
+const { Tracer } = require('./tracer.cjs');
 
 let mainWindow = null;
 let piBridge = null;
 let terminalManager = null;
+let appSettings = null;
+let tracer = null;
 function getTerminalManager() {
   if (!terminalManager) {
     const { TerminalManager } = require('./terminal-manager.cjs');
-    terminalManager = new TerminalManager(() => mainWindow, () => piBridge?.sshManager);
+    terminalManager = new TerminalManager(() => mainWindow, () => piBridge?.sshManager, tracer, appSettings);
   }
   return terminalManager;
 }
@@ -45,24 +50,45 @@ function createWindow() {
   }
 
   // 啟動 Pi RPC Bridge (傳入 app 供 CoreManager 解析 userData)
-  piBridge = new PiBridge(mainWindow, app);
+  piBridge = new PiBridge(mainWindow, app, tracer);
   mainWindow.webContents.on('did-finish-load', () => {
     // 安裝版從開始選單啟動時 cwd 是安裝目錄，不適合當預設工作區
     piBridge.start(app.isPackaged ? os.homedir() : process.cwd());
   });
 
   mainWindow.on('closed', () => {
+    if (tracer) tracer.log('app', '主視窗關閉，結束所有終端機與子程序');
     if (piBridge) piBridge.stop();
     if (terminalManager) terminalManager.killAll();
     mainWindow = null;
   });
   // 重新載入頁面時，舊的終端機已無人接收，一併關閉
   mainWindow.webContents.on('did-start-navigation', (_e, _url, isInPlace, isMainFrame) => {
-    if (isMainFrame && !isInPlace && terminalManager) terminalManager.killAll();
+    if (isMainFrame && !isInPlace) {
+      if (tracer) tracer.log('app', '主頁面重新載入，關閉所有終端機（tmux 開啟時遠端工作不受影響）');
+      if (terminalManager) terminalManager.killAll();
+    }
   });
 }
 
 app.whenReady().then(() => {
+  // 桌面程式自身設定（trace 開關與目錄等），必須早於 window 與 bridge
+  appSettings = new AppSettings(app);
+  tracer = new Tracer(appSettings, app);
+  // trace 寫入失敗（例如 R: 不存在）時只回報一次，讓 UI 有辦法提示
+  appSettings.onTraceError = (message) => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send('trace:error', { message, dir: tracer.dir, file: tracer.filePath });
+    }
+  };
+  // ssh-manager 的 trace 是模組級注入（不經 app-settings 單例）
+  setTracer(tracer);
+  tracer.log('app', '應用程式啟動', {
+    version: app.getVersion(),
+    packaged: app.isPackaged,
+    argv: process.argv.slice(1),
+  });
+
   createWindow();
 
   app.on('activate', () => {
@@ -71,10 +97,18 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => {
+  if (tracer) tracer.log('app', '所有視窗已關閉');
   if (piBridge) piBridge.stop();
   if (terminalManager) terminalManager.killAll();
   if (process.platform !== 'darwin') {
     app.quit();
+  }
+});
+
+app.on('before-quit', () => {
+  if (tracer) {
+    tracer.log('app', '應用程式即將結束');
+    tracer.closeStream();
   }
 });
 
@@ -673,6 +707,122 @@ ipcMain.handle('core:restart', async () => {
     return true;
   }
   return false;
+});
+
+// 桌面程式設定（Trace 記錄等）IPC Handlers
+ipcMain.handle('settings:get', async () => {
+  if (!appSettings) return { success: false, error: 'AppSettings not ready' };
+  return {
+    success: true,
+    settings: {
+      trace: appSettings.getSection('trace'),
+      remoteTerminal: appSettings.getSection('remoteTerminal'),
+    },
+    file: appSettings.getFilePath(),
+    stats: tracer ? tracer.getStats() : null,
+  };
+});
+
+ipcMain.handle('settings:set', async (event, patch) => {
+  if (!appSettings) return { success: false, error: 'AppSettings not ready' };
+  try {
+    // 只允許寫入已知區塊，避免前端任意擴寫設定檔
+    const safePatch = {};
+    if (patch && typeof patch === 'object') {
+      if (patch.trace && typeof patch.trace === 'object') {
+        safePatch.trace = {};
+        if (typeof patch.trace.enabled === 'boolean') safePatch.trace.enabled = patch.trace.enabled;
+        if (typeof patch.trace.dir === 'string') safePatch.trace.dir = patch.trace.dir;
+      }
+      if (patch.remoteTerminal && typeof patch.remoteTerminal === 'object') {
+        safePatch.remoteTerminal = {};
+        if (typeof patch.remoteTerminal.useTmux === 'boolean') {
+          safePatch.remoteTerminal.useTmux = patch.remoteTerminal.useTmux;
+        }
+      }
+    }
+
+    appSettings.update(safePatch);
+    if (tracer) {
+      tracer.log('settings', '設定已更新', safePatch);
+      tracer.writeMarker('設定變更' + (safePatch.trace?.enabled === true ? '（trace 開啟）' : safePatch.trace?.enabled === false ? '（trace 關閉）' : ''));
+    }
+    return { success: true, settings: { trace: appSettings.getSection('trace'), remoteTerminal: appSettings.getSection('remoteTerminal') }, file: appSettings.getFilePath() };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// 測試寫入：在使用者選定的目錄實際試寫一個檔案，回報成敗
+ipcMain.handle('trace:test-write', async () => {
+  if (!tracer) return { success: false, error: 'Tracer not ready' };
+  const res = tracer.testWrite();
+  return { ...res, stats: tracer.getStats() };
+});
+
+ipcMain.handle('trace:get-stats', async () => {
+  if (!tracer) return null;
+  return tracer.getStats();
+});
+
+// 開啟 trace 檔案或所在資料夾（讓使用者不必自己找 R:\Temp）
+ipcMain.handle('trace:open', async (event, { mode } = {}) => {
+  if (!tracer) return { success: false, error: 'Tracer not ready' };
+  try {
+    if (mode === 'folder') {
+      const dir = tracer.dir;
+      if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+      await shell.openPath(dir);
+      return { success: true, path: dir };
+    }
+    if (!fs.existsSync(tracer.filePath)) {
+      return { success: false, error: 'trace 檔案尚不存在（可能從未寫入）' };
+    }
+    await shell.openPath(tracer.filePath);
+    return { success: true, path: tracer.filePath };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
+});
+
+// 選擇 trace 目錄
+ipcMain.handle('trace:choose-dir', async () => {
+  if (!mainWindow) return { success: false, error: 'no window' };
+  const current = tracer ? tracer.dir : undefined;
+  const result = await dialog.showOpenDialog(mainWindow, {
+    title: '選擇 trace 記錄目錄',
+    defaultPath: current && fs.existsSync(current) ? current : os.homedir(),
+    properties: ['openDirectory', 'createDirectory'],
+  });
+  if (result.canceled || !result.filePaths?.length) return { success: false, canceled: true };
+  return { success: true, dir: result.filePaths[0] };
+});
+
+// 立即寫一筆標記，方便使用者在 trace 裡標出「問題發生的時間點」
+ipcMain.handle('trace:mark', async (event, { text } = {}) => {
+  if (!tracer) return { success: false, error: 'Tracer not ready' };
+  tracer.log('marker', `使用者標記：${text || '(無說明)'}`, {
+    activeConvId: piBridge?.activeConvId || null,
+    processes: piBridge ? piBridge.processes.size : 0,
+    terminals: terminalManager ? terminalManager.terms.size : 0,
+  });
+  return { success: true, stats: tracer.getStats() };
+});
+
+// 顯示 trace 檔案位置（唯讀）
+ipcMain.handle('trace:reveal', async () => {
+  if (!tracer) return { success: false, error: 'Tracer not ready' };
+  try {
+    if (fs.existsSync(tracer.filePath)) {
+      shell.showItemInFolder(tracer.filePath);
+      return { success: true, path: tracer.filePath };
+    }
+    const dir = tracer.dir;
+    if (fs.existsSync(dir)) shell.showItemInFolder(dir);
+    return { success: true, path: tracer.filePath, note: '檔案尚未建立，已改開目錄' };
+  } catch (err) {
+    return { success: false, error: err.message };
+  }
 });
 
 // 模型細項設定 IPC Handlers

@@ -3,6 +3,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const { quotePosix } = require('./ssh-manager.cjs');
+const { truncate } = require('./tracer.cjs');
 
 let pty = null;
 let ptyLoadError = null;
@@ -28,6 +29,19 @@ const exists = (p) => {
     return false;
   }
 };
+
+// 由遠端工作目錄推導出穩定、可重複 attach 的 tmux session 名稱
+// 同名 = 同一個持久終端 → 斷線/關面板/重開 App 後 attach 回來畫面還在
+function tmuxSessionName(remoteDir) {
+  const raw = String(remoteDir || '~').replace(/\/+$/, '');
+  // 依序退到最後一段目錄名；'~' 或空字串算 home
+  const base =
+    raw === '~' || raw === ''
+      ? 'home'
+      : raw.split('/').filter(Boolean).pop() || 'home';
+  const safe = base.replace(/[^A-Za-z0-9_-]/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'home';
+  return `piui-${safe}`;
+}
 
 // 在 PATH 中尋找執行檔（快顯暫存）
 const whichCache = new Map();
@@ -96,12 +110,23 @@ function detectShells() {
 }
 
 class TerminalManager {
-  constructor(getWindow, getSshManager) {
+  constructor(getWindow, getSshManager, tracer, appSettings) {
     this.getWindow = getWindow;
     this.getSshManager = getSshManager;
+    this.tracer = tracer || null;
+    this.appSettings = appSettings || null;
     this.terms = new Map(); // id -> pty
     this.seq = 0;
     this.shells = null;
+  }
+
+  // 集中管理 trace（tracer 未啟用時僅是一次布林判斷）
+  trace(category, message, data) {
+    if (this.tracer) this.tracer.log(category, message, data);
+  }
+
+  tracePtyOut(message, data) {
+    if (this.tracer) this.tracer.logPtyOut(message, data);
   }
 
   send(channel, payload) {
@@ -121,7 +146,10 @@ class TerminalManager {
 
   create({ shellId, cwd, cols, rows, ssh } = {}) {
     const ptyLib = ensurePty();
-    if (!ptyLib) return { success: false, error: `node-pty 無法載入：${ptyLoadError?.message || 'unknown'}` };
+    if (!ptyLib) {
+      this.trace('term:create', 'node-pty 無法載入', { error: String(ptyLoadError?.message || ptyLoadError) });
+      return { success: false, error: `node-pty 無法載入：${ptyLoadError?.message || 'unknown'}` };
+    }
 
     // 若為 SSH 遠端專案且未強制指定本機 shellId，直接開啟遠端 SSH 互動式終端機
     if (ssh && ssh.host && !shellId) {
@@ -130,9 +158,22 @@ class TerminalManager {
         const normSsh = sshMgr ? sshMgr.normalizeSshConfig(ssh) : ssh;
         const sshExe = process.platform === 'win32' ? (which('ssh.exe') || 'ssh.exe') : 'ssh';
         const remoteDir = cwd || '~';
-        const remoteCmd = remoteDir === '~'
-          ? 'exec ${SHELL:-/bin/bash} -l'
-          : `cd ${quotePosix(remoteDir)} 2>/dev/null || true; exec \${SHELL:-/bin/bash} -l`;
+        const cdPart =
+          remoteDir === '~' || remoteDir === ''
+            ? 'cd "$HOME"'
+            : `cd ${quotePosix(remoteDir)}`;
+
+        // 預設用 tmux 包住互動 shell：
+        // ssh 通道斷掉時，遠端 pty 被摧毀 → kernel 會送 SIGHUP 給 session 前景程序群組，
+        // 把使用者正在跑的長工作一併殺掉。用 tmux 當 session 邊界就沒這問題。
+        const useTmux = this.appSettings?.getSection('remoteTerminal')?.useTmux !== false;
+        const tmuxName = tmuxSessionName(remoteDir);
+        const shellExec = 'exec \${SHELL:-/bin/bash} -l';
+        const remoteCmd = useTmux
+          ? `if command -v tmux >/dev/null 2>&1; then ${cdPart} 2>/dev/null || true; ` +
+            `exec tmux new-session -A -s ${quotePosix(tmuxName)}; fi; ` +
+            `${cdPart} 2>/dev/null || true; ${shellExec}`
+          : `${cdPart} 2>/dev/null || true; ${shellExec}`;
 
         const sshArgs = [
           '-t',
@@ -149,6 +190,15 @@ class TerminalManager {
           ? sshMgr.buildSshEnv(normSsh)
           : { ...process.env, TERM: 'xterm-256color', COLORTERM: 'truecolor' };
 
+        this.trace('term:create', '開啟 SSH 終端機', {
+          host: normSsh.host,
+          port: normSsh.port || 22,
+          remoteDir,
+          tmux: useTmux ? tmuxName : '(未使用)',
+          cols,
+          rows,
+        });
+
         const proc = ptyLib.spawn(sshExe, sshArgs, {
           name: 'xterm-256color',
           cols: Math.max(2, cols || 80),
@@ -159,14 +209,19 @@ class TerminalManager {
         });
         const id = `term-${++this.seq}`;
         this.terms.set(id, proc);
-        proc.onData((data) => this.send('term:data', { id, data }));
+        proc.onData((data) => {
+          this.tracePtyOut(`term=${id} ssh=${normSsh.host}`, { term: id, data: truncate(data, 4000) });
+          this.send('term:data', { id, data });
+        });
         proc.onExit(({ exitCode }) => {
+          this.trace('pty:exit', `term=${id} ssh=${normSsh.host}`, { exitCode });
           this.terms.delete(id);
           this.send('term:exit', { id, exitCode });
         });
-        const shellName = `SSH: ${normSsh.host}`;
-        return { success: true, id, shellId: 'ssh', shellName, cwd: remoteDir };
+        const shellName = useTmux ? `SSH: ${normSsh.host} (tmux)` : `SSH: ${normSsh.host}`;
+        return { success: true, id, shellId: 'ssh', shellName, cwd: remoteDir, tmux: useTmux ? tmuxName : null };
       } catch (e) {
+        this.trace('term:create', 'SSH 終端機建立失敗', { error: e.message });
         return { success: false, error: e.message };
       }
     }
@@ -185,18 +240,25 @@ class TerminalManager {
       });
       const id = `term-${++this.seq}`;
       this.terms.set(id, proc);
-      proc.onData((data) => this.send('term:data', { id, data }));
+      this.trace('term:create', '開啟本機終端機', { shell: shell.id, shellPath: shell.path, workDir, cols, rows });
+      proc.onData((data) => {
+        this.tracePtyOut(`term=${id} shell=${shell.id}`, { term: id, data: truncate(data, 4000) });
+        this.send('term:data', { id, data });
+      });
       proc.onExit(({ exitCode }) => {
+        this.trace('pty:exit', `term=${id} shell=${shell.id}`, { exitCode });
         this.terms.delete(id);
         this.send('term:exit', { id, exitCode });
       });
       return { success: true, id, shellId: shell.id, shellName: shell.name, cwd: workDir };
     } catch (e) {
+      this.trace('term:create', '本機終端機建立失敗', { shell: shell?.id, error: e.message });
       return { success: false, error: e.message };
     }
   }
 
   write(id, data) {
+    this.trace('pty:in', `term=${id}`, { data: truncate(data, 2000) });
     this.terms.get(id)?.write(data);
   }
 
@@ -214,6 +276,7 @@ class TerminalManager {
     const t = this.terms.get(id);
     if (!t) return;
     this.terms.delete(id);
+    this.trace('term:kill', `term=${id}`);
     try {
       t.kill();
     } catch {
@@ -222,6 +285,7 @@ class TerminalManager {
   }
 
   killAll() {
+    if (this.terms.size > 0) this.trace('term:kill-all', '關閉所有終端機', { count: this.terms.size });
     for (const id of [...this.terms.keys()]) this.kill(id);
   }
 }

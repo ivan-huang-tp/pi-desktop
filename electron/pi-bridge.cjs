@@ -5,6 +5,7 @@ const os = require('os');
 const { randomBytes, randomUUID } = require('crypto');
 const { CoreManager } = require('./core-manager.cjs');
 const { SshManager } = require('./ssh-manager.cjs');
+const { truncate } = require('./tracer.cjs');
 
 const delay = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -70,6 +71,16 @@ class PiProcess {
   }
 
   start() {
+    const startMs = Date.now();
+    this.startedAt = startMs;
+    this.bridge.trace('pi:spawn', '啟動 pi 子程序', {
+      convId: this.convId,
+      mode: this.ssh ? 'ssh' : 'local',
+      host: this.ssh ? this.ssh.host : null,
+      workspace: this.workspace,
+      sessionFile: this.requestedSessionFile,
+    });
+
     if (this.ssh) {
       this.process = this.bridge.sshManager.spawnRemotePiRpc(this.ssh, this.workspace);
     } else {
@@ -92,16 +103,23 @@ class PiProcess {
       }
     }
 
-    this.process.stdout.on('data', (chunk) => this.onData(chunk));
+    this.process.stdout.on('data', (chunk) => {
+      this.bridge.trace('pi:in', `conv=${this.convId}`, { data: truncate(chunk.toString(), 8000) });
+      this.onData(chunk);
+    });
     if (this.process.stderr) {
       this.process.stderr.on('data', (chunk) => {
         const text = chunk.toString().trim();
-        if (text) console.error(`[PiProcess:${this.convId}] ${text}`);
+        if (text) {
+          console.error(`[PiProcess:${this.convId}] ${text}`);
+          this.bridge.trace('pi:stderr', `conv=${this.convId}`, { text: truncate(text, 8000) });
+        }
       });
     }
 
     this.process.on('error', (err) => {
       console.error(`[PiProcess:${this.convId}] 進程啟動錯誤:`, err);
+      this.bridge.trace('pi:error', `conv=${this.convId}`, { error: err.message });
       this.bridge.sendToRenderer('pi:status', { convId: this.convId, running: false, error: err.message });
       this._rejectAll(err.message);
     });
@@ -109,6 +127,16 @@ class PiProcess {
     this.process.on('close', (code) => {
       const intentional = this.disposed;
       console.log(`[PiProcess:${this.convId}] 已退出，Exit Code: ${code}`);
+      // 連線異常時，這裡是使用者最需要看的一行：uptime 很短 + code!=0 通常就是斷線
+      this.bridge.trace('pi:exit', `conv=${this.convId}`, {
+        code,
+        intentional,
+        mode: this.ssh ? 'ssh' : 'local',
+        host: this.ssh ? this.ssh.host : null,
+        uptimeMs: this.startedAt ? Date.now() - this.startedAt : null,
+        wasStreaming: this.isStreaming,
+        pendingRequests: this.pending.size,
+      });
       this.bridge.sendToRenderer('pi:status', { convId: this.convId, running: false, code });
       this.disposed = true;
       this._rejectAll('process closed');
@@ -155,12 +183,16 @@ class PiProcess {
       const trimmed = line.trim();
       if (!trimmed) continue;
       // 忽略遠端 SSH 可能印出的登入橫幅 (MOTD) 等非 JSON 行
-      if (!trimmed.startsWith('{')) continue;
+      if (!trimmed.startsWith('{')) {
+        this.bridge.trace('pi:noise', `conv=${this.convId}`, { line: truncate(trimmed, 1000) });
+        continue;
+      }
       let event;
       try {
         event = JSON.parse(trimmed);
       } catch (err) {
         console.error('[PiBridge] 無法解析 JSON:', trimmed);
+        this.bridge.trace('pi:badjson', `conv=${this.convId}`, { line: truncate(trimmed, 2000), error: err.message });
         continue;
       }
       this.handleEvent(event);
@@ -168,7 +200,11 @@ class PiProcess {
   }
 
   sendCommand(cmd) {
-    if (!this.process || !this.process.stdin || !this.process.stdin.writable) return false;
+    if (!this.process || !this.process.stdin || !this.process.stdin.writable) {
+      this.bridge.trace('pi:cmd-drop', `conv=${this.convId}`, { cmd, reason: 'stdin 不可寫' });
+      return false;
+    }
+    this.bridge.trace('pi:cmd', `conv=${this.convId}`, { cmd: truncate(JSON.stringify(cmd), 2000) });
     this.process.stdin.write(JSON.stringify(cmd) + '\n');
     return true;
   }
@@ -177,11 +213,19 @@ class PiProcess {
     return new Promise((resolve) => {
       const id = cmd.id || `c-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
       cmd.id = id;
+      const sentAt = Date.now();
       const timer = setTimeout(() => {
         this.pending.delete(id);
+        this.bridge.trace('pi:timeout', `conv=${this.convId}`, {
+          command: cmd.type,
+          id,
+          timeoutMs,
+          mode: this.ssh ? 'ssh' : 'local',
+          host: this.ssh ? this.ssh.host : null,
+        });
         resolve({ success: false, error: 'timeout' });
       }, timeoutMs);
-      this.pending.set(id, { resolve, timer });
+      this.pending.set(id, { resolve, timer, cmd: cmd.type, sentAt });
       if (!this.sendCommand(cmd)) {
         clearTimeout(timer);
         this.pending.delete(id);
@@ -193,10 +237,24 @@ class PiProcess {
   handleEvent(event) {
     // 對應等待中的指令回應
     if (event.type === 'response' && event.id && this.pending.has(event.id)) {
-      const { resolve, timer } = this.pending.get(event.id);
+      const { resolve, timer, cmd, sentAt } = this.pending.get(event.id);
       clearTimeout(timer);
       this.pending.delete(event.id);
+      this.bridge.trace('pi:resp', `conv=${this.convId}`, {
+        command: cmd || event.command,
+        id: event.id,
+        success: event.success,
+        elapsedMs: sentAt ? Date.now() - sentAt : null,
+      });
       resolve(event);
+    }
+
+    // 其餘事件只記事件類型，避免 trace 被串流內容洗掉（內容已在 pi:in 記過）
+    if (event.type !== 'response') {
+      this.bridge.trace('pi:event', `conv=${this.convId}`, {
+        type: event.type,
+        subagentId: event.subagentId,
+      });
     }
 
     // 更新狀態
@@ -352,16 +410,22 @@ class PiProcess {
  * PiBridge：對外統一窗口，管理多個 PiProcess（一個對話一個程序）
  * ========================================================================== */
 class PiBridge {
-  constructor(mainWindow, app) {
+  constructor(mainWindow, app, tracer) {
     this.mainWindow = mainWindow;
     this.app = app;
-    this.coreManager = new CoreManager(app);
+    this.tracer = tracer || null;
+    this.coreManager = new CoreManager(app, tracer);
     this.sshManager = new SshManager(app);
     this.processes = new Map(); // convId -> PiProcess
     this.reclaimTimers = new Map(); // convId -> Timeout
     this.currentWorkspace = process.cwd();
     this.activeCoreInfo = null;
     this.activeConvId = null; // 目前畫面上開著的對話（閒置時保留，避免每次送出都重生）
+    if (this.tracer) this.tracer.log('app', 'PiBridge 初始化', { userData: app?.getPath ? app.getPath('userData') : null });
+  }
+
+  trace(category, message, data) {
+    if (this.tracer) this.tracer.log(category, message, data);
   }
 
   // 初始化核心資訊（不主動開程序，改為前端 ensure 時才開）
@@ -370,10 +434,17 @@ class PiBridge {
     this.activeCoreInfo = this.coreManager.resolveCore();
     console.log(`[PiBridge] 啟用核心: [${this.activeCoreInfo.type}] v${this.activeCoreInfo.version}`);
     console.log(`[PiBridge] 預設工作目錄: ${this.currentWorkspace}`);
+    this.trace('app', 'PiBridge 啟動', {
+      coreType: this.activeCoreInfo.type,
+      coreVersion: this.activeCoreInfo.version,
+      coreDir: this.activeCoreInfo.baseDir,
+      workspace: this.currentWorkspace,
+    });
     this.sendToRenderer('core:info', this.activeCoreInfo);
   }
 
   restart(workspacePath) {
+    this.trace('app', 'PiBridge 重啟', { workspace: workspacePath || this.currentWorkspace });
     // 重啟核心：先把所有子程序關掉，之後前端再 ensure 時會用新核心重生
     for (const convId of Array.from(this.processes.keys())) {
       this.disposeProcess(convId);

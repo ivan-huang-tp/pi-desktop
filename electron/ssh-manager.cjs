@@ -6,6 +6,15 @@ const os = require('os');
 const START_MARKER = '__PI_UI_JSON_START__';
 const END_MARKER = '__PI_UI_JSON_END__';
 
+// 主程序注入的 tracer（未啟用時所有 trace 呼叫都是 no-op）
+let tracer = null;
+function setTracer(t) {
+  tracer = t;
+}
+function tr(category, message, data) {
+  if (tracer) tracer.log(category, message, data);
+}
+
 // 將字串安全包成 POSIX 單引號字串：'abc' -> 'abc', a'b -> 'a'\''b'
 function quotePosix(str) {
   const s = String(str ?? '');
@@ -203,8 +212,7 @@ class SshManager {
   // 建立給 ssh 執行檔的基礎參數陣列
   buildSshBaseArgs(ssh, { interactive = false } = {}) {
     const norm = this.normalizeSshConfig(ssh);
-    const args = [
-      interactive ? '-t' : '-T',
+    const args = [      interactive ? '-t' : '-T',
       '-o', 'StrictHostKeyChecking=accept-new',
       '-o', 'ConnectTimeout=10',
       '-o', 'ServerAliveInterval=15',
@@ -244,11 +252,29 @@ class SshManager {
     const args = [...this.buildSshBaseArgs(ssh, { interactive: false }), remoteCmd];
     const env = this.buildSshEnv(ssh);
 
-    return spawn('ssh', args, {
+    const norm = this.normalizeSshConfig(ssh);
+    tr('ssh:spawn', '啟動遠端 pi rpc', { host: norm?.host, port: norm?.port || 22, remoteCwd });
+
+    const proc = spawn('ssh', args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       env,
       windowsHide: true,
     });
+
+    proc.on('error', (err) => {
+      tr('ssh:spawn', '遠端 pi rpc 啟動失敗', { host: norm?.host, error: err.message });
+    });
+    proc.on('close', (code, signal) => {
+      tr('ssh:spawn', '遠端 pi rpc 結束', { host: norm?.host, code, signal });
+    });
+    if (proc.stderr) {
+      proc.stderr.on('data', (chunk) => {
+        const text = chunk.toString().trim();
+        if (text) tr('ssh:stderr', `host=${norm?.host}`, { text });
+      });
+    }
+
+    return proc;
   }
 
   // 在遠端透過 Base64 + 標記安全執行一段 Node.js 函式並取回 JSON 結果
@@ -259,8 +285,7 @@ class SshManager {
         return resolve({ success: false, error: '無效的 SSH 主機設定' });
       }
 
-      const wrappedJs = `
-(async () => {
+      const wrappedJs = `(async () => {
   try {
     const payload = ${JSON.stringify(payload)};
     const fn = ${fnSource};
@@ -273,7 +298,22 @@ class SshManager {
 `.trim();
 
       const b64 = Buffer.from(wrappedJs, 'utf-8').toString('base64');
-      const nodeCmd = `node -e "eval(Buffer.from('${b64}','base64').toString())"`;
+      // 小腳本走 argv（沿用原本行為），大腳本改走 stdin。
+      // 原因：node -e "eval(...)" 是把整包 base64 塞進「單一命令列參數」，
+      // 會撞上 Linux 的 MAX_ARG_STRLEN。
+      // 2026-10-21 對 bfgpuubuntu 實測：script 60KB（base64 80KB）仍 OK，
+      // script 100KB（base64 133KB）→ `Argument list too long`。
+      // 門檻取 60000 是留給 env 與外層 shell 的安全餘量，
+      // 超過就走 stdin（實測 2.6MB base64 仍然正常）。
+      const ARGV_LIMIT = 60000;
+      const useStdin = b64.length > ARGV_LIMIT;
+
+      const nodeArgvCmd = `node -e "eval(Buffer.from('${b64}','base64').toString())"`;
+      // 從 fd 0 讀 base64 後再 eval，參數長度固定，與 payload 大小無關
+      // 注意：這裡的 stdin 是「腳本本身」的 base64（payload 內嵌在腳本裡）
+      const nodeStdinCmd = `node -e "eval(Buffer.from(require('fs').readFileSync(0,'utf8'),'base64').toString())"`;
+      const nodeCmd = useStdin ? nodeStdinCmd : nodeArgvCmd;
+
       const shBody = [
         REMOTE_PATH_SETUP,
         'if command -v node >/dev/null 2>&1; then',
@@ -289,20 +329,43 @@ class SshManager {
       const args = [...this.buildSshBaseArgs(norm, { interactive: false }), remoteCmd];
       const env = this.buildSshEnv(norm);
 
+      tr('ssh:execNode', '遠端 Node 呼叫', {
+        host: norm.host,
+        payloadBytes: b64.length,
+        transport: useStdin ? 'stdin' : 'argv',
+        timeoutMs,
+      });
+
       let stdout = '';
       let stderr = '';
       let settled = false;
 
       const child = spawn('ssh', args, {
-        stdio: ['ignore', 'pipe', 'pipe'],
+        stdio: ['pipe', 'pipe', 'pipe'],
         env,
         windowsHide: true,
       });
+
+      // 大 payload 走 stdin：寫入後務必 end()，遠端 node 才會收到 EOF
+      if (useStdin) {
+        try {
+          child.stdin.end(b64);
+        } catch (e) {
+          tr('ssh:execNode', '寫入 stdin 失敗', { host: norm.host, error: e.message });
+        }
+      } else {
+        try {
+          child.stdin.end();
+        } catch {
+          /* ignore */
+        }
+      }
 
       const timer = setTimeout(() => {
         if (settled) return;
         settled = true;
         try { child.kill(); } catch {}
+        tr('ssh:execNode', '遠端 Node 呼叫逾時', { host: norm.host, transport: useStdin ? 'stdin' : 'argv' });
         resolve({ success: false, error: 'SSH 連線逾時（請確認主機位址、網路或認證設定）' });
       }, timeoutMs);
 
@@ -313,6 +376,7 @@ class SshManager {
         if (settled) return;
         settled = true;
         clearTimeout(timer);
+        tr('ssh:execNode', '無法啟動 ssh', { host: norm.host, error: err.message });
         resolve({ success: false, error: `無法啟動系統 ssh：${err.message}` });
       });
 
@@ -343,6 +407,13 @@ class SshManager {
         if (errText.toLowerCase().includes('permission denied')) {
           return resolve({ success: false, error: `SSH 認證失敗 (Permission denied)：請確認 SSH Key 或輸入正確密碼` });
         }
+        tr('ssh:execNode', '遠端 Node 呼叫失敗', {
+          host: norm.host,
+          transport: useStdin ? 'stdin' : 'argv',
+          code,
+          stdout: stdout.slice(0, 2000),
+          stderr: stderr.slice(0, 2000),
+        });
         resolve({ success: false, error: errText });
       });
     });
@@ -1622,4 +1693,4 @@ class SshManager {
   }
 }
 
-module.exports = { SshManager, quotePosix };
+module.exports = { SshManager, quotePosix, setTracer };

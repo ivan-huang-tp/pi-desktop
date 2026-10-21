@@ -11,6 +11,8 @@ const ALLOWED_PREFIXES = [
   'dialog:',
   'shell:',
   'clipboard:',
+  'settings:',
+  'trace:',
 ];
 
 function isAllowedChannel(channel) {

@@ -10,7 +10,8 @@ import {
   Terminal,
   FolderOpen,
   Cpu,
-  Server
+  Server,
+  SlidersHorizontal
 } from 'lucide-react';
 import type { Project, Session, CoreInfo } from '../types';
 
@@ -24,6 +25,7 @@ interface SidebarProps {
   coreInfo?: CoreInfo | null;
   onOpenCoreManager?: () => void;
   onOpenModelSettings?: () => void;
+  onOpenAppSettings?: () => void;
   /** 對「對話」按右鍵 */
   onSessionContextMenu?: (session: Session, project: Project, x: number, y: number) => void;
   /** 對「專案」按右鍵 */
@@ -46,6 +48,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   coreInfo,
   onOpenCoreManager,
   onOpenModelSettings,
+  onOpenAppSettings,
   onSessionContextMenu,
   onProjectContextMenu,
   onBlankContextMenu,
@@ -244,6 +247,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
             className="p-1.5 rounded-md hover:bg-zinc-800 hover:text-zinc-200 text-zinc-400 transition"
           >
             <Cpu size={14} />
+          </button>
+          <button 
+            title="程式設定（Trace 記錄、遠端終端機）" 
+            onClick={onOpenAppSettings}
+            className="p-1.5 rounded-md hover:bg-zinc-800 hover:text-zinc-200 text-zinc-400 transition"
+          >
+            <SlidersHorizontal size={14} />
           </button>
           <button 
             title="Pi 核心設定與更新" 

@@ -4,9 +4,14 @@ const https = require('https');
 const { exec, spawn } = require('child_process');
 
 class CoreManager {
-  constructor(app) {
+  constructor(app, tracer) {
     this.app = app;
+    this.tracer = tracer || null;
     this.packageName = '@earendil-works/pi-coding-agent';
+  }
+
+  trace(category, message, data) {
+    if (this.tracer) this.tracer.log(category, message, data);
   }
 
   // 取得使用者更新目錄
@@ -31,6 +36,16 @@ class CoreManager {
 
   // 解析當前優先使用的核心
   resolveCore() {
+    const core = this._resolveCore();
+    this.trace('core:resolve', '解析核心', {
+      type: core.type,
+      version: core.version,
+      baseDir: core.baseDir,
+    });
+    return core;
+  }
+
+  _resolveCore() {
     const userDir = this.getUserCoreDir();
     
     // 1. 檢查使用者更新目錄（自訂安裝的最新版本）
@@ -162,6 +177,7 @@ class CoreManager {
 
     logCallback(`[更新管理] 準備更新核心至版本: ${targetVersion}`);
     logCallback(`[更新管理] 安裝目標目錄: ${userDir}`);
+    this.trace('core:update', '開始更新核心', { targetVersion, userDir });
 
     return new Promise((resolve, reject) => {
       // 優先使用 npm install
@@ -190,6 +206,7 @@ class CoreManager {
   // 重設還原至內建版本
   resetToBundled() {
     const userDir = this.getUserCoreDir();
+    this.trace('core:reset', '還原為內建核心', { userDir });
     if (fs.existsSync(userDir)) {
       try {
         fs.rmSync(userDir, { recursive: true, force: true });
