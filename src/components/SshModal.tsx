@@ -25,8 +25,7 @@ interface SshModalProps {
   onProjectAdded: (project: { id: string; name: string; path: string; ssh: SshConfig }) => void;
 }
 
-const electron = (window as any).require ? (window as any).require('electron') : null;
-const ipcRenderer = electron?.ipcRenderer;
+import { ipcRenderer } from '../lib/ipc';
 
 export const SshModal: React.FC<SshModalProps> = ({
   isOpen,

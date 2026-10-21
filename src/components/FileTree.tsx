@@ -45,8 +45,7 @@ const MonacoCodeEditor = lazy(() =>
   import('./MonacoCodeEditor').then((m) => ({ default: m.MonacoCodeEditor }))
 );
 
-const electron = (window as any).require ? (window as any).require('electron') : null;
-const ipcRenderer = electron?.ipcRenderer;
+import { ipcRenderer } from '../lib/ipc';
 
 const SHOW_HIDDEN_STORAGE_KEY = 'pi-ui:files-show-hidden';
 const WORD_WRAP_STORAGE_KEY = 'pi-ui:editor-word-wrap';

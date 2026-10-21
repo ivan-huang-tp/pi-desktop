@@ -12,6 +12,7 @@ import {
   FolderGit2
 } from 'lucide-react';
 import type { CoreInfo, CheckUpdateResult } from '../types';
+import { ipcRenderer } from '../lib/ipc';
 
 interface CoreManagerModalProps {
   isOpen: boolean;
@@ -32,9 +33,6 @@ export const CoreManagerModal: React.FC<CoreManagerModalProps> = ({
   const [updateLogs, setUpdateLogs] = useState<string[]>([]);
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
 
-  const electron = (window as any).require ? (window as any).require('electron') : null;
-  const ipcRenderer = electron?.ipcRenderer;
-
   useEffect(() => {
     if (!ipcRenderer) return;
 
@@ -44,9 +42,9 @@ export const CoreManagerModal: React.FC<CoreManagerModalProps> = ({
 
     ipcRenderer.on('core:update-log', handleLog);
     return () => {
-      ipcRenderer.removeListener('core:update-log', handleLog);
+      ipcRenderer?.removeListener('core:update-log', handleLog);
     };
-  }, [ipcRenderer]);
+  }, []);
 
   if (!isOpen) return null;
 

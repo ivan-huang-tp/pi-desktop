@@ -4,9 +4,8 @@ import { FitAddon } from '@xterm/addon-fit';
 import { Plus, X, ChevronDown, Trash2, Terminal as TerminalIcon, Server } from 'lucide-react';
 import type { SshConfig } from '../types';
 
-// 取得 Electron IPC（在 Electron 環境中可用）
-const electron = (window as any).require ? (window as any).require('electron') : null;
-const ipcRenderer = electron?.ipcRenderer;
+// 取得受控 Electron IPC（透過 preload contextBridge 暴露）
+import { ipcRenderer } from '../lib/ipc';
 
 interface ShellInfo {
   id: string;
@@ -171,7 +170,7 @@ const TerminalInstance: React.FC<TerminalInstanceProps> = ({
           }
           // StrictMode 或快速關閉：建立完成時元件已卸載 → 直接關掉
           if (disposed) {
-            ipcRenderer.send('term:kill', { id: res.id });
+            ipcRenderer?.send('term:kill', { id: res.id });
             return;
           }
           ptyIdRef.current = res.id;

@@ -26,9 +26,10 @@ function createWindow() {
     autoHideMenuBar: true,
     title: 'Pi Agent Desktop',
     webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false,
-      webSecurity: false,
+      preload: path.join(__dirname, 'preload.cjs'),
+      nodeIntegration: false,
+      contextIsolation: true,
+      webSecurity: true,
     },
   });
 

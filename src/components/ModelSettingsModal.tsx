@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { ipcRenderer } from '../lib/ipc';
 import {
   Cpu,
   Brain,
@@ -58,9 +59,6 @@ export const ModelSettingsModal: React.FC<ModelSettingsModalProps> = ({
   activeConvId,
   onModelChanged,
 }) => {
-  const electron = (window as any).require ? (window as any).require('electron') : null;
-  const ipcRenderer = electron?.ipcRenderer;
-
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ text: string; type: 'success' | 'error' } | null>(null);

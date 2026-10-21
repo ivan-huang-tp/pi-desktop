@@ -31,9 +31,8 @@ const textFromResult = (r: any): string | undefined => {
   return undefined;
 };
 
-// 取得 Electron IPC（在 Electron 環境中可用）
-const electron = (window as any).require ? (window as any).require('electron') : null;
-const ipcRenderer = electron?.ipcRenderer;
+// 取得受控 Electron IPC（透過 preload contextBridge 暴露）
+import { ipcRenderer } from './lib/ipc';
 
 // 產生對話用的唯一 id
 const uuid = () =>
@@ -567,8 +566,9 @@ export const App: React.FC = () => {
     });
 
     return () => {
-      ipcRenderer.removeAllListeners('pi:ready');
-      ipcRenderer.removeAllListeners('pi:event');
+      ipcRenderer?.removeListener('core:info', handleCoreInfo);
+      ipcRenderer?.removeAllListeners('pi:ready');
+      ipcRenderer?.removeAllListeners('pi:event');
     };
   }, []);
 
